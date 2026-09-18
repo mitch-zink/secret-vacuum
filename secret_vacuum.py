@@ -136,6 +136,57 @@ class Finding:
         }
 
 
+@dataclass
+class Group:
+    """One distinct secret value, wherever it appears. The same credential copied
+    across seven worktrees is one thing to deal with, not seven, so the UI lists
+    values and an action applies to every copy."""
+
+    key: str  # sha256 prefix of the value
+    members: list[Finding]
+
+    @property
+    def lead(self) -> Finding:
+        return self.members[0]
+
+    @property
+    def tracked(self) -> bool:
+        return any(m.tracked for m in self.members)
+
+    @property
+    def removable(self) -> bool:
+        return all(m.removable for m in self.members)
+
+    @property
+    def suggested(self) -> str:
+        return "remove" if all(m.suggested == "remove" for m in self.members) else "redact"
+
+    def public(self) -> dict:
+        return {
+            "key": self.key,
+            "rule": self.lead.rule,
+            "description": self.lead.description,
+            "masked": mask(self.lead.secret),
+            "length": len(self.lead.secret),
+            "copies": len(self.members),
+            "display": display_path(self.lead.path),
+            "line": self.lead.start_line,
+            "paths": [f"{display_path(m.path)}:{m.start_line}" for m in self.members[:40]],
+            "tracked": self.tracked,
+            "tracked_copies": sum(m.tracked for m in self.members),
+            "removable": self.removable,
+            "suggested": self.suggested,
+        }
+
+
+def group_findings(findings: list[Finding]) -> list[Group]:
+    by_value: dict[str, list[Finding]] = {}
+    for f in findings:
+        by_value.setdefault(f.sha8, []).append(f)
+    groups = [Group(k, sorted(v, key=lambda m: m.path)) for k, v in by_value.items()]
+    return sorted(groups, key=lambda g: (not g.tracked, -len(g.members), g.lead.path))
+
+
 def mask(value: str) -> str:
     """First four and last four. You should not need to read a secret to decide on it."""
     v = value.strip()
@@ -252,13 +303,17 @@ def redact_lines(lines: list[str], f: Finding) -> tuple[list[str], bool]:
     return out, True
 
 
-def apply_actions(findings: dict[str, Finding], requested: list[dict]) -> dict:
-    """One trash batch per call. Removals win over redactions on the same file."""
+def apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
+    """One trash batch per call. Removals win over redactions on the same file.
+    An action on a group applies to every copy of that value."""
     chosen = [
-        (findings[r["fingerprint"]], r["action"])
+        (member, r["action"])
         for r in requested
-        if r.get("fingerprint") in findings and r.get("action") in ACTIONS
+        if r.get("key") in groups and r.get("action") in ACTIONS
+        for member in groups[r["key"]].members
     ]
+    owner = {m.fingerprint: r["key"] for r in requested if r.get("key") in groups
+             for m in groups[r["key"]].members}
     remove = {f.path for f, a in chosen if a == "remove" and f.removable}
     results, entries = [], []
     batch = _batch_dir() if any(a != "ignore" for _, a in chosen) else None
@@ -303,6 +358,23 @@ def apply_actions(findings: dict[str, Finding], requested: list[dict]) -> dict:
         elif a == "ignore":
             add_ignore(f.fingerprint)
             results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
+
+    rolled: dict[str, dict] = {}
+    for r in results:
+        key = owner.get(r["fingerprint"])
+        if key is None:
+            continue
+        agg = rolled.setdefault(key, {"key": key, "ok": False, "done": 0, "failed": 0, "detail": ""})
+        agg["done" if r["ok"] else "failed"] += 1
+        if not r["ok"] and not agg["detail"]:
+            agg["detail"] = r["detail"]
+    for agg in rolled.values():
+        agg["ok"] = agg["done"] > 0 and agg["failed"] == 0
+        if agg["ok"]:
+            agg["detail"] = f"handled {agg['done']} cop{'y' if agg['done'] == 1 else 'ies'}"
+        elif agg["done"]:
+            agg["detail"] = f"{agg['done']} done, {agg['failed']} skipped: {agg['detail']}"
+    results = list(rolled.values())
 
     if batch:
         # Paths, rule ids and hashes only. No secret value reaches this file.
@@ -396,14 +468,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, b"forbidden", "text/plain")
         route = urlparse(self.path).path
         if route == "/api/rescan":
-            self.state["findings"] = {f.fingerprint: f for f in scan(self.state["roots"])}
+            self.state["groups"] = {g.key: g for g in group_findings(scan(self.state["roots"]))}
             self.state["scanned_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             return self._json(self.snapshot())
         if not self.state["apply"]:
             return self._json({"error": "preview mode: restart with --apply to make changes"}, 403)
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         if route == "/api/apply":
-            out = apply_actions(self.state["findings"], body.get("actions", []))
+            out = apply_actions(self.state["groups"], body.get("actions", []))
         elif route == "/api/undo":
             out = undo()
         else:
@@ -413,8 +485,10 @@ class Handler(BaseHTTPRequestHandler):
         self._json({**out, **self.snapshot()})
 
     def snapshot(self) -> dict:
+        groups = list(self.state["groups"].values())
         return {
-            "findings": [f.public() for f in self.state["findings"].values()],
+            "findings": [g.public() for g in groups],
+            "locations": sum(len(g.members) for g in groups),
             "apply": self.state["apply"],
             "roots": [display_path(r) for r in self.state["roots"]],
             "scanned_at": self.state["scanned_at"],
@@ -425,7 +499,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(findings: list[Finding], roots: list[str], apply_mode: bool, open_browser: bool = True) -> str:
     Handler.state = {
-        "findings": {f.fingerprint: f for f in findings},
+        "groups": {g.key: g for g in group_findings(findings)},
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
@@ -449,18 +523,17 @@ def serve(findings: list[Finding], roots: list[str], apply_mode: bool, open_brow
 
 
 def print_table(findings: list[Finding]) -> None:
-    if not findings:
+    groups = group_findings(findings)
+    if not groups:
         print("No secrets found.")
         return
-    width = min(max(len(display_path(f.path)) for f in findings), 58)
-    print(f"{'FILE':<{width}}  {'LINE':>5}  {'RULE':<24}  {'VALUE':<18}  FLAGS")
-    for f in findings:
-        flags = "committed" if f.tracked else ""
-        print(f"{display_path(f.path)[-width:]:<{width}}  {f.start_line:>5}  "
-              f"{f.rule[:24]:<24}  {mask(f.secret):<18}  {flags}")
-    tracked = sum(f.tracked for f in findings)
-    print(f"\n{len(findings)} finding(s), {tracked} committed to a repo (rotate those, deleting the file "
-          f"does not unleak them).")
+    print(f"{'VALUE':<18}  {'RULE':<24}  {'COPIES':>6}  {'FLAGS':<10}  FIRST SEEN")
+    for g in groups:
+        print(f"{mask(g.lead.secret):<18}  {g.lead.rule[:24]:<24}  {len(g.members):>6}  "
+              f"{'committed' if g.tracked else '':<10}  {display_path(g.lead.path)[-60:]}:{g.lead.start_line}")
+    tracked = sum(g.tracked for g in groups)
+    print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
+          f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
 
 
 def main(argv: list[str] | None = None) -> int:

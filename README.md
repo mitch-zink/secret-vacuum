@@ -6,6 +6,8 @@ Two files, no dependencies. Detection is entirely [gitleaks](https://github.com/
 default ruleset, so this tool writes no regexes of its own. It is the scanner, a table with
 checkboxes, and a trash can.
 
+![secret-vacuum UI](docs/ui.png)
+
 ```
 brew install gitleaks
 git clone https://github.com/mitch-zink/secret-vacuum && cd secret-vacuum
@@ -22,15 +24,29 @@ python3 secret_vacuum.py --apply    # UI with the actions enabled
 python3 secret_vacuum.py undo       # put the last batch back
 ```
 
-Three actions per finding:
+## One row per secret, not per hit
+
+A scan of a real machine is dominated by the same credential appearing over and over: seven
+worktrees of one repo, a value pasted into three config files, a token echoed through committed
+logs. secret-vacuum groups findings by the value itself, so each row is one credential and the
+`copies` column says how many places it lives. An action applies to every copy.
+
+On the machine this was built against that is the difference between **2,029 rows and 118**. It is
+the same data either way; one of them is a list you can actually work through.
+
+Three actions per secret:
 
 | Action | What happens on disk | For |
 |---|---|---|
-| **remove** | the whole file moves to `~/.secret-vacuum/trash/<batch>/`, path preserved | `.env`, `*.pem`, `id_rsa`: files that are nothing but credential |
+| **remove** | every file holding the value moves to `~/.secret-vacuum/trash/<batch>/`, paths preserved | `.env`, `*.pem`, `id_rsa`: files that are nothing but credential |
 | **redact** | the file is copied to the trash, then the secret is replaced in place with `<removed by secret-vacuum>` | `.zshrc`, `settings.json`, `.mcp.json`: one bad line in a file you need |
-| **ignore** | the finding's fingerprint is appended to `~/.secret-vacuum/.gitleaksignore` | false positives: presigned URLs, UUIDs, pagination cursors, content hashes |
+| **ignore** | each copy's fingerprint is appended to `~/.secret-vacuum/.gitleaksignore` | false positives: presigned URLs, UUIDs, pagination cursors, content hashes |
 
 `undo` restores the most recent batch. Trash is never emptied for you.
+
+Generated and vendored trees (`node_modules`, `.venv`, `site-packages`, `dist`, `.terraform`,
+lockfiles and friends) are skipped via `gitleaks.toml`, which is passed with `--config` so a
+scanned repository's own `.gitleaks.toml` cannot allowlist away its leaks behind your back.
 
 ## Secrets already committed to a repo
 

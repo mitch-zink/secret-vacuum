@@ -39,6 +39,9 @@
   button.primary:hover:not(:disabled){filter:brightness(1.1)}
   .wrap{padding:0 20px 60px}
   .tbl-scroll{overflow-x:auto}
+  td.num,th.num{font-variant-numeric:tabular-nums;text-align:right;padding-right:14px}
+  .more{font:11px var(--mono);color:var(--faint);cursor:pointer;margin-top:3px}
+  .locs{font:11.5px var(--mono);color:var(--soft);margin:5px 0 2px;max-height:180px;overflow:auto}
   table{width:100%;border-collapse:collapse;margin-top:4px}
   th{font:10.5px var(--mono);text-transform:uppercase;letter-spacing:.09em;color:var(--faint);
     text-align:left;padding:10px 10px 8px 0;border-bottom:1px solid var(--rule);white-space:nowrap}
@@ -85,8 +88,8 @@
   <div class="tbl-scroll">
   <table id="tbl" hidden>
     <thead><tr>
-      <th style="width:28px"></th><th>File</th><th class="hide">Line</th>
-      <th>Rule</th><th class="hide">Value</th><th>Flags</th><th>Action</th><th>Result</th>
+      <th style="width:28px"></th><th class="hide">Value</th><th>Where it is</th>
+      <th>Rule</th><th class="num">Copies</th><th>Flags</th><th>Action</th><th>Result</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -114,19 +117,24 @@ function visible() {
   const q = $("filter").value.trim().toLowerCase();
   const only = $("onlyCommitted").checked;
   return state.findings.filter(
-    (f) => (!only || f.tracked) && (!q || f.display.toLowerCase().includes(q) || f.rule.includes(q))
+    (f) =>
+      (!only || f.tracked) &&
+      (!q || f.rule.includes(q) || f.paths.some((p) => p.toLowerCase().includes(q)))
   );
 }
 
 function render() {
   const rows = visible();
-  $("count").textContent = `${state.findings.length} finding${state.findings.length === 1 ? "" : "s"}`;
+  const n = state.findings.length;
+  $("count").textContent = n
+    ? `${n} distinct secret${n === 1 ? "" : "s"} across ${state.locations} location${state.locations === 1 ? "" : "s"}`
+    : "";
   $("mode").textContent = state.apply ? "apply mode" : "preview, read only";
   $("mode").className = "mode " + (state.apply ? "apply" : "preview");
 
   const committed = state.findings.filter((f) => f.tracked).length;
   $("banner").innerHTML = committed
-    ? `<div class="note"><b>${committed} of these are committed to a repo.</b> Removing the file here does
+    ? `<div class="note"><b>${committed} of these appear in a committed file.</b> Removing the file here does
        not unleak the value. It is in every clone and in the history. Rotate those credentials.
        They are still removable; you just need to know that removing is not enough.</div>`
     : "";
@@ -139,7 +147,7 @@ function render() {
 
   $("rows").innerHTML = rows
     .map((f) => {
-      const r = results[f.fingerprint];
+      const r = results[f.key];
       const opts = ["remove", "redact", "ignore"]
         .map((a) => {
           const off = a === "remove" && !f.removable;
@@ -148,14 +156,20 @@ function render() {
         })
         .join("");
       return `<tr class="${r && r.ok ? "gone" : ""}">
-        <td><input type="checkbox" class="pick" data-fp="${f.fingerprint}" ${r && r.ok ? "disabled" : ""}></td>
-        <td><div class="path">${f.display}</div><div class="rule">${f.description}</div></td>
-        <td class="hide val">${f.line}${f.lines > 1 ? `–${f.line + f.lines - 1}` : ""}</td>
+        <td><input type="checkbox" class="pick" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}></td>
+        <td class="hide val" title="${f.length} chars">${f.masked}</td>
+        <td><div class="path">${f.display}:${f.line}</div>
+            <div class="rule">${f.copies > 1
+              ? `and ${f.copies - 1} more copy${f.copies > 2 ? "ies" : ""} &middot; ${f.description}`
+              : f.description}</div>
+            ${f.copies > 1 ? `<details><summary class="more">all ${f.copies} locations</summary>
+              <div class="locs">${f.paths.join("<br>")}${f.copies > f.paths.length
+                ? `<br>and ${f.copies - f.paths.length} more` : ""}</div></details>` : ""}</td>
         <td class="rule">${f.rule}</td>
-        <td class="hide val" title="${f.length} chars, sha256 ${f.sha8}">${f.masked}</td>
+        <td class="num val">${f.copies}</td>
         <td>${f.tracked ? '<span class="tag committed">committed</span>' : ""}
             ${!f.removable ? '<span class="tag">history</span>' : ""}</td>
-        <td><select class="act" data-fp="${f.fingerprint}" ${r && r.ok ? "disabled" : ""}>${opts}</select></td>
+        <td><select class="act" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}>${opts}</select></td>
         <td>${r ? `<span class="tag ${r.ok ? "ok" : "fail"}">${r.detail}</span>` : ""}</td>
       </tr>`;
     })
@@ -172,14 +186,14 @@ const picked = () => [...document.querySelectorAll(".pick:checked")].map((c) => 
 function syncApply() {
   const n = picked().length;
   $("apply").disabled = n === 0 || !state.apply;
-  $("apply").textContent = state.apply ? (n ? `Remove ${n} selected` : "Apply") : "Preview mode";
+  $("apply").textContent = state.apply ? (n ? `Apply to ${n} selected` : "Apply") : "Preview mode";
   $("apply").title = state.apply ? "" : "Restart with --apply to make changes";
 }
 
 async function load(path, body) {
   $("empty").textContent = "Scanning…";
   const data = await api(path, body);
-  if (data.results) for (const r of data.results) results[r.fingerprint] = r;
+  if (data.results) for (const r of data.results) results[r.key] = r;
   state = data;
   render();
 }
@@ -193,11 +207,13 @@ $("rescan").onclick = () => { results = {}; load("/api/rescan", {}); };
 $("undo").onclick = () => load("/api/undo", {});
 $("apply").onclick = () => {
   const acts = picked().map((fp) => ({
-    fingerprint: fp,
+    key: fp,
     action: document.querySelector(`.act[data-fp="${fp}"]`).value,
   }));
-  const removes = acts.filter((a) => a.action === "remove").length;
-  if (!confirm(`Move ${removes} file(s) to the trash and redact/ignore ${acts.length - removes} more?\n\nUndo restores everything from this batch.`)) return;
+  const copies = acts.reduce(
+    (t, a) => t + (state.findings.find((f) => f.key === a.key)?.copies || 0), 0);
+  if (!confirm(`Apply to ${acts.length} secret(s) across ${copies} file location(s)?\n\n` +
+               `Undo restores everything from this batch.`)) return;
   load("/api/apply", { actions: acts });
 };
 

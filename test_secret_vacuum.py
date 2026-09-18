@@ -39,6 +39,12 @@ def finding(path: str, secret: str, line: int = 1, end: int | None = None) -> sv
     )
 
 
+def act(action: str, *findings: sv.Finding) -> dict:
+    """Apply one action to the group each finding belongs to."""
+    groups = {g.key: g for g in sv.group_findings(list(findings))}
+    return sv.apply_actions(groups, [{"key": k, "action": action} for k in groups])
+
+
 def sandbox(tmp_path: Path) -> None:
     """Point all tool state at a temp dir so tests never touch the real ~/.secret-vacuum."""
     sv.STATE = tmp_path / "state"
@@ -83,7 +89,7 @@ def test_manifest_records_paths_not_values(tmp_path: Path):
     target = tmp_path / "creds.env"
     target.write_text(f"token={FAKE_STRIPE}\n")
     f = finding(str(target), FAKE_STRIPE)
-    sv.apply_actions({f.fingerprint: f}, [{"fingerprint": f.fingerprint, "action": "remove"}])
+    act("remove", f)
     manifest = next(sv.TRASH.rglob("manifest.json")).read_text()
     assert FAKE_STRIPE not in manifest
     assert str(target) in manifest
@@ -100,7 +106,7 @@ def test_remove_moves_to_trash_and_undo_restores_byte_identical(tmp_path: Path):
     target.write_text(original)
 
     f = finding(str(target), FAKE_AWS_ID)
-    out = sv.apply_actions({f.fingerprint: f}, [{"fingerprint": f.fingerprint, "action": "remove"}])
+    out = act("remove", f)
 
     assert out["results"][0]["ok"] and not target.exists()
     stashed = sv.TRASH / out["batch"] / "files" / str(target).lstrip("/")
@@ -118,7 +124,7 @@ def test_history_files_are_redact_only(tmp_path: Path):
     hist.write_text(f"curl -H 'Authorization: Bearer {FAKE_STRIPE}'\n")
     f = finding(str(hist), FAKE_STRIPE)
     assert not f.removable
-    out = sv.apply_actions({f.fingerprint: f}, [{"fingerprint": f.fingerprint, "action": "remove"}])
+    out = act("remove", f)
     assert not out["results"][0]["ok"]
     assert hist.exists(), "a shell history file must never be removed wholesale"
 
@@ -128,13 +134,52 @@ def test_remove_wins_over_redact_on_the_same_file(tmp_path: Path):
     target = tmp_path / "two.env"
     target.write_text(f"a={FAKE_AWS_ID}\nb={FAKE_STRIPE}\n")
     a, b = finding(str(target), FAKE_AWS_ID, 1), finding(str(target), FAKE_STRIPE, 2)
-    out = sv.apply_actions(
-        {a.fingerprint: a, b.fingerprint: b},
-        [{"fingerprint": a.fingerprint, "action": "remove"},
-         {"fingerprint": b.fingerprint, "action": "redact"}],
-    )
+    groups = {g.key: g for g in sv.group_findings([a, b])}
+    out = sv.apply_actions(groups, [
+        {"key": a.sha8, "action": "remove"},
+        {"key": b.sha8, "action": "redact"},
+    ])
     assert not target.exists()
     assert sum(r["ok"] for r in out["results"]) == 1
+
+
+def test_one_value_in_many_places_is_one_row_and_one_action(tmp_path: Path):
+    """The multiplier that makes a real machine unreadable: the same credential
+    copied across worktrees. It is one secret, and removing it clears every copy."""
+    sandbox(tmp_path)
+    copies = []
+    for tree in ("repo-main", "repo-featureA", "repo-featureB"):
+        f = tmp_path / tree / ".env"
+        f.parent.mkdir(parents=True)
+        f.write_text(f"KEY={FAKE_STRIPE}\n")
+        copies.append(f)
+    other = tmp_path / "unrelated" / ".env"
+    other.parent.mkdir()
+    other.write_text(f"KEY={FAKE_AWS_ID}\n")
+
+    found = sv.scan([str(tmp_path)])
+    groups = sv.group_findings(found)
+    assert len(found) == 4 and len(groups) == 2, "four locations, two distinct values"
+
+    shared = next(g for g in groups if g.lead.secret == FAKE_STRIPE)
+    assert shared.public()["copies"] == 3
+    assert FAKE_STRIPE not in json.dumps(shared.public())
+
+    out = sv.apply_actions({shared.key: shared}, [{"key": shared.key, "action": "remove"}])
+    assert out["results"][0]["ok"] and out["results"][0]["detail"] == "handled 3 copies"
+    assert not any(c.exists() for c in copies), "every copy of the value is gone"
+    assert other.exists(), "an unrelated secret is untouched"
+
+    assert sv.undo()["ok"]
+    assert all(c.exists() for c in copies)
+
+
+def test_a_group_is_committed_if_any_copy_is(tmp_path: Path):
+    a = finding("/x/loose/.env", FAKE_STRIPE)
+    b = finding("/x/repo/.env", FAKE_STRIPE)
+    b.tracked = True
+    g = sv.group_findings([a, b])[0]
+    assert g.tracked and g.public()["tracked_copies"] == 1
 
 
 # --------------------------------------------------------------- redaction is surgical
@@ -147,7 +192,7 @@ def test_redaction_replaces_only_the_secret(tmp_path: Path):
     target.write_text(before)
 
     f = finding(str(target), FAKE_STRIPE, line=2)
-    sv.apply_actions({f.fingerprint: f}, [{"fingerprint": f.fingerprint, "action": "redact"}])
+    act("redact", f)
 
     after = target.read_text().splitlines(keepends=True)
     assert FAKE_STRIPE not in target.read_text()
@@ -160,7 +205,7 @@ def test_redaction_refuses_when_the_value_moved(tmp_path: Path):
     target = tmp_path / "moved.env"
     target.write_text("nothing to see here\n")
     f = finding(str(target), FAKE_STRIPE, line=1)
-    out = sv.apply_actions({f.fingerprint: f}, [{"fingerprint": f.fingerprint, "action": "redact"}])
+    out = act("redact", f)
     assert not out["results"][0]["ok"]
     assert target.read_text() == "nothing to see here\n", "refuse rather than corrupt"
 
@@ -171,7 +216,7 @@ def test_multiline_block_is_replaced_whole(tmp_path: Path):
     body = "-----BEGIN RSA PRIVATE KEY-----\nAAAA\nBBBB\n-----END RSA PRIVATE KEY-----\n"
     pem.write_text("keep\n" + body)
     f = finding(str(pem), body, line=2, end=5)
-    sv.apply_actions({f.fingerprint: f}, [{"fingerprint": f.fingerprint, "action": "redact"}])
+    act("redact", f)
     assert pem.read_text() == f"keep\n{sv.PLACEHOLDER}\n"
 
 
@@ -286,7 +331,7 @@ def test_real_gitleaks_finds_a_planted_secret_and_the_round_trip_clears_it(tmp_p
     f = next(x for x in found if x.secret == FAKE_AWS_ID)
     assert f.rule == "aws-access-token" and not f.tracked
 
-    sv.apply_actions({f.fingerprint: f}, [{"fingerprint": f.fingerprint, "action": "remove"}])
+    act("remove", f)
     assert sv.scan([str(root)]) == [], "rescan is clean once the file is gone"
 
     sv.undo()
