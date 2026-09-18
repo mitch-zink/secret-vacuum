@@ -283,11 +283,22 @@ def test_suggested_action_never_defaults_to_removing_a_file_you_need():
     assert [f.suggested for f in (rc, settings, hist)] == ["redact"] * 3
 
 
+# Every allowlisted tree in gitleaks.toml. A typo in one of those regexes fails
+# silently, so each pattern gets a planted secret here.
+GENERATED_TREES = [
+    "node_modules/p/c.env", "bower_components/p/c.env", "vendor/p/c.env", "Pods/p/c.env",
+    "dbt_packages/p/c.env", ".venv/l/c.env", "venv/l/c.env", "x/site-packages/p/c.env",
+    "__pycache__/c.env", ".mypy_cache/c.env", ".pytest_cache/c.env", ".tox/c.env",
+    "dist/c.env", "build/c.env", "out/c.env", "target/c.env", ".next/c.env",
+    ".gradle/c.env", ".terraform/c.env", "coverage/c.env", "htmlcov/c.env",
+    "package-lock.json", "app.min.js",
+]
+
+
 def test_generated_trees_are_not_reported(tmp_path: Path):
     """A dependency cache full of other people's fixtures is not your leak."""
     sandbox(tmp_path)
-    for rel in ("node_modules/pkg/fixture.env", "src/.venv/lib/site-packages/x/conf.env",
-                "app/dist/bundle.env", "real/service.env"):
+    for rel in [*GENERATED_TREES, "real/service.env"]:
         f = tmp_path / rel
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(f"aws_access_key_id = {FAKE_AWS_ID}\n")
