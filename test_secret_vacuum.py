@@ -255,6 +255,44 @@ def test_multiline_block_is_replaced_whole(tmp_path: Path):
     assert pem.read_text() == f"keep\n{sv.PLACEHOLDER}\n"
 
 
+def test_a_clean_scan_returns_nothing_whatever_gitleaks_prints(tmp_path: Path):
+    """Success is the exit code, not the shape of stdout. gitleaks 8.30.1 prints "[]"
+    on a clean scan, but keying off that would break on any version that prints
+    nothing, so an empty stdout with a zero exit is simply no findings."""
+    sandbox(tmp_path)
+    (tmp_path / "boring.txt").write_text("nothing secret here\n")
+    assert sv.scan([str(tmp_path)]) == []
+
+    real_run = subprocess.run
+
+    def silent_success(cmd, **kw):  # gitleaks that completes but prints nothing
+        if "gitleaks" in cmd[0] and "dir" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return real_run(cmd, **kw)
+
+    sv.subprocess.run = silent_success
+    try:
+        assert sv.scan_root(tmp_path) == [], "empty stdout with exit 0 is a clean scan"
+    finally:
+        sv.subprocess.run = real_run
+
+    def noisy_failure(cmd, **kw):  # gitleaks that dies
+        if "gitleaks" in cmd[0] and "dir" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "FTL something broke")
+        return real_run(cmd, **kw)
+
+    sv.subprocess.run = noisy_failure
+    try:
+        raised = False
+        try:
+            sv.scan_root(tmp_path)
+        except RuntimeError as e:
+            raised = "something broke" in str(e)
+        assert raised, "a non-zero exit must raise even though stdout was empty too"
+    finally:
+        sv.subprocess.run = real_run
+
+
 def test_a_scanner_failure_is_loud_not_an_empty_result(tmp_path: Path):
     """A broken config or a missing binary must never read as "you are clean"."""
     sandbox(tmp_path)

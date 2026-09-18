@@ -237,11 +237,19 @@ def scan_root(root: Path) -> list[dict]:
         cmd += ["--gitleaks-ignore-path", str(IGNORE_FILE)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     out = r.stdout.strip()
-    if not out.startswith("["):
-        # A scanner that failed must never read as "nothing found" in a tool whose
-        # whole job is finding things.
+    # Success is the exit code, not the shape of stdout. With --exit-code 0 gitleaks
+    # returns 0 for a completed scan whether or not it found anything, and non-zero
+    # for a real error. Judging by stdout instead would be version-fragile, and a
+    # scanner that failed must never read as "nothing found" in a tool whose whole
+    # job is finding things.
+    if r.returncode != 0:
         raise RuntimeError(f"gitleaks failed on {root}: {(r.stderr or out).strip()[:400]}")
-    return json.loads(out)
+    if not out:
+        return []  # completed, found nothing
+    try:
+        return json.loads(out)
+    except ValueError as e:
+        raise RuntimeError(f"gitleaks returned unreadable output for {root}: {e}") from None
 
 
 def scan(roots: list[str], progress: bool = False) -> list[Finding]:
