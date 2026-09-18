@@ -390,6 +390,43 @@ def test_two_single_line_secrets_on_one_line_both_get_redacted(tmp_path: Path):
     assert text.count(sv.PLACEHOLDER) == 2
 
 
+def test_a_failed_redaction_leaves_no_backup_and_does_not_touch_the_file(tmp_path: Path):
+    """An orphaned stash is an extra plaintext copy of a secret we did not remove."""
+    sandbox(tmp_path)
+    target = tmp_path / "unchanged.env"
+    target.write_text("nothing to redact here\n")
+    before = target.stat().st_mtime_ns
+
+    stale = finding(str(target), FAKE_STRIPE, line=1)  # value is not in the file
+    out = act("redact", stale)
+
+    assert not out["results"][0]["ok"]
+    assert target.read_text() == "nothing to redact here\n"
+    assert target.stat().st_mtime_ns == before, "an untouched file must keep its mtime"
+    assert out["batch"] is None, "no batch should be recorded"
+    assert not list(sv.TRASH.rglob("unchanged.env")), "no orphaned copy in the trash"
+
+
+def test_a_partial_redaction_still_backs_the_file_up(tmp_path: Path):
+    """One of two succeeding must still produce a recoverable original."""
+    sandbox(tmp_path)
+    target = tmp_path / "partial.env"
+    original = f"A={FAKE_AWS_ID}\nB=plain\n"
+    target.write_text(original)
+
+    good = finding(str(target), FAKE_AWS_ID, line=1)
+    stale = finding(str(target), FAKE_STRIPE, line=2)
+    stale.fingerprint += ":2"
+    groups = {g.key: g for g in sv.group_findings([good, stale])}
+    out = sv.apply_actions(groups, [{"key": k, "action": "redact"} for k in groups])
+
+    assert sorted(r["ok"] for r in out["results"]) == [False, True]
+    assert FAKE_AWS_ID not in target.read_text()
+    stashed = list(sv.TRASH.rglob("partial.env"))
+    assert len(stashed) == 1 and stashed[0].read_text() == original
+    assert sv.undo()["ok"] and target.read_text() == original
+
+
 # --------------------------------------------------------------- guarantee 3: server is locked down
 
 

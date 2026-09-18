@@ -352,8 +352,8 @@ def apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
         if not src.is_file():
             results += [{"fingerprint": f.fingerprint, "ok": False, "detail": "file is gone"} for f in group]
             continue
-        _stash(batch, src)
         lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+        changed = False
         for f in sorted(group, key=lambda f: -f.start_line):
             lines, ok = redact_lines(lines, f)
             results.append({
@@ -361,9 +361,15 @@ def apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
                 "detail": "redacted" if ok else "value no longer on that line, left alone",
             })
             if ok:
+                changed = True
                 entries.append({"path": path, "action": "redact", "rule": f.rule,
                                 "sha8": f.sha8, "line": f.start_line})
-        src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
+        # Only touch the file if something actually changed. Stashing regardless
+        # would leave an orphaned copy of the secret in the trash and bump the
+        # mtime of a file we did not edit. The original is still on disk here.
+        if changed:
+            _stash(batch, src)
+            src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
 
     moved: set[str] = set()
     for f, a in chosen:
