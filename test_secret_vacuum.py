@@ -141,8 +141,8 @@ def test_remove_wins_over_redact_on_the_same_file(tmp_path: Path):
     a, b = finding(str(target), FAKE_AWS_ID, 1), finding(str(target), FAKE_STRIPE, 2)
     groups = {g.key: g for g in sv.group_findings([a, b])}
     out = sv.apply_actions(groups, [
-        {"key": a.sha8, "action": "remove"},
-        {"key": b.sha8, "action": "redact"},
+        {"key": a.digest, "action": "remove"},
+        {"key": b.digest, "action": "redact"},
     ])
     assert not target.exists()
     # The redaction never ran, but its value went with the file, so both selected
@@ -611,6 +611,47 @@ def test_scan_json_output_is_grouped_and_carries_no_values(tmp_path: Path):
     assert len(groups) == 1 and groups[0]["copies"] == 2
     assert FAKE_STRIPE not in payload
     assert "key" in groups[0] and "paths" in groups[0]
+
+
+def test_a_non_ascii_token_is_refused_not_a_crash(tmp_path: Path):
+    """hmac.compare_digest raises TypeError on a non-ASCII str, so comparing the
+    decoded query token as a string turned a bad token into a 500."""
+    sandbox(tmp_path)
+    url = sv.serve([], [], apply_mode=False, open_browser=False)
+    base, token = url.split("/?t=")
+
+    for bad in ("%C3%A9caf%C3%A9", "caf%C3%A9", "%F0%9F%92%A9"):
+        code, _ = request(f"{base}/api/findings?t={bad}")
+        assert code == 403, f"non-ascii token {bad} should be refused, got {code}"
+
+    code, _ = request(base + f"/api/findings?t={token}")
+    assert code == 200, "the real token still works"
+
+
+def test_grouping_keys_on_the_whole_digest(tmp_path: Path):
+    """A 32-bit prefix collides about once in a million at this scale, and the
+    consequence is removing a different secret's files."""
+    f = finding("/x/.env", FAKE_STRIPE)
+    assert len(f.digest) == 64 and f.sha8 == f.digest[:8]
+    group = sv.group_findings([f])[0]
+    assert group.key == f.digest, "the group key must be the full digest"
+    assert group.public()["sha8"] == f.sha8, "the short form is still shown"
+    assert FAKE_STRIPE not in json.dumps(group.public())
+
+
+def test_an_empty_batch_is_not_treated_as_restorable(tmp_path: Path):
+    """A stale empty directory made undo report restoring nothing as success."""
+    sandbox(tmp_path)
+    stale = sv.TRASH / "20260101T000000.000000Z" / "files"
+    stale.mkdir(parents=True)
+    assert sv.batches() == [], "an empty batch is not a batch"
+    assert sv.undo() == {"ok": False, "detail": "nothing in the trash"}
+
+    target = tmp_path / "real.env"
+    target.write_text(f"K={FAKE_STRIPE}\n")
+    act("remove", finding(str(target), FAKE_STRIPE))
+    assert len(sv.batches()) == 1, "the stale empty one is still ignored"
+    assert sv.undo()["ok"] and target.exists()
 
 
 # --------------------------------------------------------------- guarantee 4: no network

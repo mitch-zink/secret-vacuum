@@ -108,9 +108,16 @@ class Finding:
     tracked: bool = False
 
     @property
+    def digest(self) -> str:
+        """Full SHA-256. Grouping keys off this: a 32-bit prefix collides once in
+        roughly a million at this scale, and a collision would apply one secret's
+        removal to a different secret's files."""
+        return hashlib.sha256(self.secret.encode()).hexdigest()
+
+    @property
     def sha8(self) -> str:
-        """Not reversible, and stable across runs -- safe to show and to record."""
-        return hashlib.sha256(self.secret.encode()).hexdigest()[:8]
+        """Short form, for display and for the manifest. Not reversible."""
+        return self.digest[:8]
 
     @property
     def suggested(self) -> str:
@@ -147,7 +154,7 @@ class Group:
     across seven worktrees is one thing to deal with, not seven, so the UI lists
     values and an action applies to every copy."""
 
-    key: str  # sha256 prefix of the value
+    key: str  # full sha256 of the value
     members: list[Finding]
 
     @property
@@ -169,6 +176,7 @@ class Group:
     def public(self) -> dict:
         return {
             "key": self.key,
+            "sha8": self.lead.sha8,
             "rule": self.lead.rule,
             "description": self.lead.description,
             "masked": mask(self.lead.secret),
@@ -187,7 +195,7 @@ class Group:
 def group_findings(findings: list[Finding]) -> list[Group]:
     by_value: dict[str, list[Finding]] = {}
     for f in findings:
-        by_value.setdefault(f.sha8, []).append(f)
+        by_value.setdefault(f.digest, []).append(f)
     groups = [Group(k, sorted(v, key=lambda m: m.path)) for k, v in by_value.items()]
     return sorted(groups, key=lambda g: (not g.tracked, -len(g.members), g.lead.path))
 
@@ -454,9 +462,15 @@ def add_ignore(fingerprint: str) -> None:
 
 
 def batches() -> list[Path]:
+    """Batches holding at least one file. An empty directory left behind by a
+    failed cleanup would otherwise make undo report restoring nothing as success."""
     if not TRASH.exists():
         return []
-    return sorted((d for d in TRASH.iterdir() if d.is_dir() and not d.name.endswith(".restored")))
+    return sorted(
+        d for d in TRASH.iterdir()
+        if d.is_dir() and not d.name.endswith(".restored")
+        and any(f.is_file() for f in (d / "files").rglob("*"))
+    )
 
 
 def undo(batch: Path | None = None) -> dict:
@@ -509,7 +523,10 @@ class Handler(BaseHTTPRequestHandler):
         if origin and origin != f"http://127.0.0.1:{port}":
             return False
         sent = self.headers.get("X-SV-Token") or parse_qs(urlparse(self.path).query).get("t", [""])[0]
-        return hmac.compare_digest(sent, self.state["token"])
+        # Bytes, not str: compare_digest raises TypeError on a non-ASCII string, and
+        # a bad token must fail the check rather than crash the handler.
+        return hmac.compare_digest(sent.encode("utf-8", "replace"),
+                                   self.state["token"].encode())
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
