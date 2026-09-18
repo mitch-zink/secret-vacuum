@@ -68,6 +68,11 @@ REDACT_ONLY = ("/.zsh_history", "/.bash_history")
 
 ACTIONS = ("remove", "redact", "ignore")
 
+# The server is threaded, so two clicks can land at once. apply_actions and undo
+# both take this for their whole body, so the guarantee holds for any caller and
+# not just for the request handler.
+MUTATE = threading.Lock()
+
 
 def _binary(name: str) -> str:
     """Resolve once, absolutely. A security tool should not let PATH decide which
@@ -290,7 +295,10 @@ def scan(roots: list[str], progress: bool = False) -> list[Finding]:
 
 
 def _batch_dir() -> Path:
-    d = TRASH / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Microseconds, because two applies in the same second would otherwise share a
+    # directory and a single undo would put both of them back. The format still
+    # sorts lexicographically, which is how batches() orders them.
+    d = TRASH / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     (d / "files").mkdir(parents=True, exist_ok=True)
     return d
 
@@ -329,6 +337,11 @@ def redact_lines(lines: list[str], f: Finding) -> tuple[list[str], bool]:
 def apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
     """One trash batch per call. Removals win over redactions on the same file.
     An action on a group applies to every copy of that value."""
+    with MUTATE:
+        return _apply_actions(groups, requested)
+
+
+def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
     chosen = [
         (member, r["action"])
         for r in requested
@@ -450,27 +463,31 @@ def undo(batch: Path | None = None) -> dict:
     """Put a batch back where it came from. This moves rather than copies, so a
     restored secret does not also stay behind in the trash as a second plaintext
     copy the user never asked for."""
-    batch = batch or (batches()[-1] if batches() else None)
-    if not batch:
-        return {"ok": False, "detail": "nothing in the trash"}
-    files = batch / "files"
-    restored, stuck = 0, 0
-    for src in sorted(files.rglob("*")):
-        if not src.is_file():
-            continue
-        dest = Path("/") / src.relative_to(files)
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), dest)
-            restored += 1
-        except OSError:
-            stuck += 1
-    if stuck:
-        # Something could not go home. Keep the batch rather than lose it.
-        batch.rename(batch.with_name(batch.name + ".restored"))
-        return {"ok": False, "detail": f"restored {restored}, {stuck} could not be put back"}
-    shutil.rmtree(batch, ignore_errors=True)
-    return {"ok": True, "detail": f"restored {restored} file(s) from {batch.name}"}
+    with MUTATE:
+        # One listing, taken under the lock: a second caller must see the trash as
+        # this one leaves it, not as it was before.
+        existing = batches()
+        batch = batch or (existing[-1] if existing else None)
+        if not batch or not batch.is_dir():
+            return {"ok": False, "detail": "nothing in the trash"}
+        files = batch / "files"
+        restored, stuck = 0, 0
+        for src in sorted(files.rglob("*")):
+            if not src.is_file():
+                continue
+            dest = Path("/") / src.relative_to(files)
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), dest)
+                restored += 1
+            except OSError:
+                stuck += 1
+        if stuck:
+            # Something could not go home. Keep the batch rather than lose it.
+            batch.rename(batch.with_name(batch.name + ".restored"))
+            return {"ok": False, "detail": f"restored {restored}, {stuck} could not be put back"}
+        shutil.rmtree(batch, ignore_errors=True)
+        return {"ok": True, "detail": f"restored {restored} file(s) from {batch.name}"}
 
 
 # --------------------------------------------------------------------------- server

@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -466,6 +467,65 @@ def test_a_partial_redaction_still_backs_the_file_up(tmp_path: Path):
     stashed = list(sv.TRASH.rglob("partial.env"))
     assert len(stashed) == 1 and stashed[0].read_text() == original
     assert sv.undo()["ok"] and target.read_text() == original
+
+
+def test_two_applies_never_share_a_trash_batch(tmp_path: Path):
+    """Second-granularity batch names collided, so two applies in the same second
+    landed in one directory and a single undo put both of them back."""
+    sandbox(tmp_path)
+    first, second = tmp_path / "one.env", tmp_path / "two.env"
+    first.write_text(f"K={FAKE_AWS_ID}\n")
+    second.write_text(f"K={FAKE_STRIPE}\n")
+
+    a = act("remove", finding(str(first), FAKE_AWS_ID))
+    b = act("remove", finding(str(second), FAKE_STRIPE))
+    assert a["batch"] != b["batch"], "each apply needs its own batch"
+    assert sv.batches() == sorted(sv.batches()), "batch names must still sort chronologically"
+
+    assert sv.undo()["ok"]
+    assert second.exists() and not first.exists(), "undo restores only the newest batch"
+    assert sv.undo()["ok"]
+    assert first.exists()
+
+
+def test_the_mutation_lock_is_released_even_when_apply_raises(tmp_path: Path):
+    """A leaked lock deadlocks every later action, which is worse than the crash."""
+    raised = False
+    try:
+        sv.apply_actions(None, [{"key": "x", "action": "remove"}])
+    except Exception:  # noqa: BLE001
+        raised = True
+    assert raised
+    assert not sv.MUTATE.locked(), "the lock must not survive an exception"
+
+
+def test_undo_is_safe_when_the_trash_empties_underneath_it(tmp_path: Path):
+    """undo listed the trash twice, so a concurrent undo between the two calls
+    turned it into an IndexError instead of a clean "nothing in the trash"."""
+    sandbox(tmp_path)
+    assert sv.undo() == {"ok": False, "detail": "nothing in the trash"}
+
+    target = tmp_path / "solo.env"
+    target.write_text(f"K={FAKE_STRIPE}\n")
+    act("remove", finding(str(target), FAKE_STRIPE))
+
+    done, errors = [], []
+
+    def race():
+        try:
+            done.append(sv.undo())
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=race) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent undo raised: {errors}"
+    assert sum(r["ok"] for r in done) == 1, "exactly one undo does the work"
+    assert target.exists()
 
 
 # --------------------------------------------------------------- guarantee 3: server is locked down
