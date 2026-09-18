@@ -342,17 +342,22 @@ def apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
                                 "sha8": f.sha8, "line": f.start_line})
         src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
 
+    moved: set[str] = set()
     for f, a in chosen:
         if a == "remove":
             if not f.removable:
                 results.append({"fingerprint": f.fingerprint, "ok": False,
                                 "detail": "history file: redact instead of removing"})
+            elif f.path in moved:
+                # Two secrets in one file: the first move took care of both.
+                results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
             elif not Path(f.path).exists():
                 results.append({"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"})
             else:
                 dest = batch / "files" / f.path.lstrip("/")
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(f.path, dest)  # move, never unlink
+                moved.add(f.path)
                 entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
                 results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
         elif a == "ignore":

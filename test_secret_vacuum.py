@@ -184,6 +184,22 @@ def test_a_group_is_committed_if_any_copy_is(tmp_path: Path):
     assert g.tracked and g.public()["tracked_copies"] == 1
 
 
+def test_two_secrets_in_one_file_both_report_success(tmp_path: Path):
+    """The first remove takes the file; the second must not read as a failure."""
+    sandbox(tmp_path)
+    target = tmp_path / "svc" / ".env"
+    target.parent.mkdir()
+    target.write_text(f"AWS_ACCESS_KEY_ID={FAKE_AWS_ID}\nSTRIPE={FAKE_STRIPE}\n")
+
+    groups = {g.key: g for g in sv.group_findings(sv.scan([str(tmp_path)]))}
+    assert len(groups) == 2, "two distinct values in one file"
+
+    out = sv.apply_actions(groups, [{"key": k, "action": "remove"} for k in groups])
+    assert all(r["ok"] for r in out["results"]), out["results"]
+    assert not target.exists()
+    assert sv.undo()["ok"] and target.exists()
+
+
 # --------------------------------------------------------------- redaction is surgical
 
 
