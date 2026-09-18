@@ -312,6 +312,12 @@ def redact_lines(lines: list[str], f: Finding) -> tuple[list[str], bool]:
         return lines, False
     out = list(lines)
     if f.end_line > f.start_line:  # multi-line, e.g. a PEM block
+        # Collapsing a block shortens the file, so a later finding's line numbers
+        # no longer mean what gitleaks said. Checking that the value is still in
+        # the slice catches that: two overlapping blocks would otherwise eat the
+        # lines between them.
+        if f.secret.strip() not in "".join(out[lo:hi]):
+            return lines, False
         out[lo:hi] = [f"{PLACEHOLDER}\n"]
         return out, True
     if f.secret not in out[lo]:

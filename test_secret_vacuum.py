@@ -344,6 +344,52 @@ def test_generated_trees_are_not_reported(tmp_path: Path):
     assert paths == ["service.env"], f"only the authored file should surface, got {paths}"
 
 
+def test_overlapping_multiline_redactions_do_not_eat_the_file(tmp_path: Path):
+    """Collapsing a block shortens the file, so a second overlapping block's line
+    numbers stop meaning what gitleaks said. Before this was guarded, redacting
+    two overlapping PEM-shaped findings destroyed everything between them."""
+    sandbox(tmp_path)
+    body = [f"line{i}\n" for i in range(1, 16)]
+    target = tmp_path / "overlap.txt"
+    target.write_text("".join(body))
+
+    def block(start: int, end: int) -> sv.Finding:
+        return sv.Finding(f"{target}:private-key:{start}", str(target), "private-key",
+                          "d", start, end, 4.0, "".join(body[start - 1:end]))
+
+    a, b = block(5, 10), block(8, 15)
+    out = list(body)
+    applied = []
+    for f in sorted([a, b], key=lambda f: -f.start_line):
+        out, ok = sv.redact_lines(out, f)
+        applied.append(ok)
+
+    assert applied == [True, False], "the second, now-stale block must be refused"
+    # Lines 1-4 are outside every finding and must be untouched.
+    assert out[:4] == body[:4]
+    # Nothing is invented and nothing outside the applied block is lost.
+    assert out == body[:7] + [f"{sv.PLACEHOLDER}\n"]
+    assert sum(l == f"{sv.PLACEHOLDER}\n" for l in out) == 1
+
+
+def test_two_single_line_secrets_on_one_line_both_get_redacted(tmp_path: Path):
+    """Single-line redaction does not shift indices, so overlapping on the same
+    line must still work -- the multi-line guard must not over-refuse."""
+    sandbox(tmp_path)
+    target = tmp_path / "pair.env"
+    target.write_text(f"A={FAKE_AWS_ID} B={FAKE_STRIPE}\n")
+    one = finding(str(target), FAKE_AWS_ID, line=1)
+    two = finding(str(target), FAKE_STRIPE, line=1)
+    two.fingerprint += ":2"
+
+    groups = {g.key: g for g in sv.group_findings([one, two])}
+    out = sv.apply_actions(groups, [{"key": k, "action": "redact"} for k in groups])
+    assert all(r["ok"] for r in out["results"]), out["results"]
+    text = target.read_text()
+    assert FAKE_AWS_ID not in text and FAKE_STRIPE not in text
+    assert text.count(sv.PLACEHOLDER) == 2
+
+
 # --------------------------------------------------------------- guarantee 3: server is locked down
 
 
