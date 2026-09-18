@@ -24,6 +24,9 @@ python3 secret_vacuum.py --apply    # UI with the actions enabled
 python3 secret_vacuum.py undo       # put the last batch back
 ```
 
+The first run walks your whole code directory and can take several minutes. Each root prints as it
+finishes, and the browser opens when the scan is done.
+
 ## One row per secret, not per hit
 
 A scan of a real machine is dominated by the same credential appearing over and over: seven

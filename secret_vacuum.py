@@ -26,7 +26,7 @@ import subprocess
 import sys
 import threading
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -244,10 +244,19 @@ def scan_root(root: Path) -> list[dict]:
     return json.loads(out)
 
 
-def scan(roots: list[str]) -> list[Finding]:
+def scan(roots: list[str], progress: bool = False) -> list[Finding]:
+    """A first run over a developer's whole code directory takes minutes, so say
+    what is happening rather than looking hung."""
     paths = [p for p in (Path(r).expanduser() for r in roots) if p.exists()]
+    raw: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        raw = [hit for batch in pool.map(scan_root, paths) for hit in batch]
+        futures = {pool.submit(scan_root, p): p for p in paths}
+        for done, future in enumerate(as_completed(futures), start=1):
+            hits = future.result()
+            raw += hits
+            if progress:
+                print(f"  [{done}/{len(paths)}] {display_path(str(futures[future]))} "
+                      f"({len(hits)} hit{'' if len(hits) == 1 else 's'})", flush=True)
 
     found: dict[str, Finding] = {}
     for h in raw:
@@ -576,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     roots = a.root or DEFAULT_ROOTS
     if not (a.command == "scan" and a.json):
         print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
-    findings = scan(roots)
+    findings = scan(roots, progress=not (a.command == "scan" and a.json))
 
     if a.command == "scan":
         if a.json:
