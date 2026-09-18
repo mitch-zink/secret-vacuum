@@ -408,20 +408,29 @@ def batches() -> list[Path]:
 
 
 def undo(batch: Path | None = None) -> dict:
-    """Put a batch back where it came from. Restoring marks the batch so a second
-    undo moves to the one before it rather than replaying the same one."""
+    """Put a batch back where it came from. This moves rather than copies, so a
+    restored secret does not also stay behind in the trash as a second plaintext
+    copy the user never asked for."""
     batch = batch or (batches()[-1] if batches() else None)
     if not batch:
         return {"ok": False, "detail": "nothing in the trash"}
     files = batch / "files"
-    restored = 0
+    restored, stuck = 0, 0
     for src in sorted(files.rglob("*")):
-        if src.is_file():
-            dest = Path("/") / src.relative_to(files)
+        if not src.is_file():
+            continue
+        dest = Path("/") / src.relative_to(files)
+        try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
+            shutil.move(str(src), dest)
             restored += 1
-    batch.rename(batch.with_name(batch.name + ".restored"))
+        except OSError:
+            stuck += 1
+    if stuck:
+        # Something could not go home. Keep the batch rather than lose it.
+        batch.rename(batch.with_name(batch.name + ".restored"))
+        return {"ok": False, "detail": f"restored {restored}, {stuck} could not be put back"}
+    shutil.rmtree(batch, ignore_errors=True)
     return {"ok": True, "detail": f"restored {restored} file(s) from {batch.name}"}
 
 

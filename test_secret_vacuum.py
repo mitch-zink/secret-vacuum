@@ -116,7 +116,9 @@ def test_remove_moves_to_trash_and_undo_restores_byte_identical(tmp_path: Path):
 
     assert sv.undo()["ok"]
     assert target.read_text() == original
-    # A restored batch is not replayed by the next undo.
+    # Undo moves rather than copies, so no plaintext copy is left in the trash.
+    assert not list(sv.TRASH.rglob("*.env")), "a restored secret must not stay in the trash"
+    # And a restored batch is not replayed by the next undo.
     assert sv.undo()["detail"] == "nothing in the trash"
 
 

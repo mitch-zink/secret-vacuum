@@ -2,9 +2,9 @@
 
 Finds plaintext secrets sitting on your Mac and deletes the ones you approve.
 
-Two files, no dependencies. Detection is entirely [gitleaks](https://github.com/gitleaks/gitleaks)'
-default ruleset, so this tool writes no regexes of its own. It is the scanner, a table with
-checkboxes, and a trash can.
+A script, a page and a config. No pip install, no npm, no build step. Detection is entirely
+[gitleaks](https://github.com/gitleaks/gitleaks)' default ruleset, so this tool writes no regexes
+of its own. It is the scanner, a table with checkboxes, and a trash can.
 
 ![secret-vacuum UI](docs/ui.png)
 
@@ -42,7 +42,7 @@ Three actions per secret:
 | **redact** | the file is copied to the trash, then the secret is replaced in place with `<removed by secret-vacuum>` | `.zshrc`, `settings.json`, `.mcp.json`: one bad line in a file you need |
 | **ignore** | each copy's fingerprint is appended to `~/.secret-vacuum/.gitleaksignore` | false positives: presigned URLs, UUIDs, pagination cursors, content hashes |
 
-`undo` restores the most recent batch. Trash is never emptied for you.
+`undo` restores the most recent batch, moving files back rather than copying them, so a restored secret does not linger in the trash as a second plaintext copy. Batches you do not undo stay until you delete them yourself.
 
 Generated and vendored trees (`node_modules`, `.venv`, `site-packages`, `dist`, `.terraform`,
 lockfiles and friends) are skipped via `gitleaks.toml`, which is passed with `--config` so a
