@@ -1,0 +1,59 @@
+# Config secret-vacuum hands to gitleaks on every scan.
+#
+# Two jobs:
+#
+# 1. Skip generated and vendored trees. A real scan of a developer machine is
+#    otherwise dominated by dependency caches and build output -- copies of
+#    other people's test fixtures, not your credentials. Every entry below is a
+#    directory a package manager or compiler owns, never one you author in.
+#
+# 2. Make this the config in force. gitleaks otherwise picks up a
+#    `.gitleaks.toml` from whatever directory it is pointed at, so a repository
+#    could allowlist away its own leaks and secret-vacuum would silently agree.
+#    Passing this file with --config takes precedence over that.
+#
+# Detection rules themselves are gitleaks' defaults, unmodified. Findings you
+# judge to be false positives go in ~/.secret-vacuum/.gitleaksignore via the
+# Ignore action, which records a fingerprint and never a value.
+
+title = "secret-vacuum"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated, vendored and cached trees"
+paths = [
+  # language package managers
+  '''(^|/)node_modules/''',
+  '''(^|/)bower_components/''',
+  '''(^|/)vendor/''',
+  '''(^|/)Pods/''',
+  '''(^|/)dbt_packages/''',
+  # python environments and caches
+  '''(^|/)\.?(venv|virtualenv)/''',
+  '''(^|/)site-packages/''',
+  '''(^|/)__pycache__/''',
+  '''\.pyc$''',
+  '''(^|/)\.(mypy_cache|pytest_cache|ruff_cache|tox)/''',
+  '''(^|/)\.eggs?(-info)?/''',
+  # build output
+  '''(^|/)(dist|build|out|target)/''',
+  '''(^|/)\.(next|nuxt|svelte-kit|parcel-cache|turbo)/''',
+  '''(^|/)\.gradle/''',
+  '''\.min\.(js|css)$''',
+  '''\.map$''',
+  # infrastructure plugin caches
+  '''(^|/)\.terraform/''',
+  # lockfiles: transitive integrity hashes, never credentials
+  '''(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Cargo\.lock|Gemfile\.lock)$''',
+  # coverage and test reports
+  '''(^|/)(coverage|htmlcov|\.nyc_output)/''',
+  # git internals; history is out of scope for this tool by design
+  '''(^|/)\.git/''',
+]
+
+[[allowlists]]
+description = "S3 presigned URLs carry a key id by design and expose no secret"
+regexTarget = "line"
+regexes = ['''X-Amz-Credential=''', '''X-Amz-Signature=''']

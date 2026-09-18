@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""secret-vacuum: find plaintext secrets on this machine, remove the ones you approve.
+
+Detection is entirely gitleaks' default ruleset -- this tool writes no regexes. It is
+glue: run the scanner, show the hits, move the approved ones to a local trash.
+
+Four guarantees, each covered by a test in test_secret_vacuum.py:
+  1. no secret value is ever written to disk by this tool
+  2. "remove" moves a file to a local trash; nothing is ever unlinked
+  3. the HTTP server binds loopback only and requires a per-run token
+  4. nothing is ever sent off the machine
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+HOME = Path.home()
+STATE = Path(os.environ.get("SECRET_VACUUM_HOME", HOME / ".secret-vacuum"))
+TRASH = STATE / "trash"
+IGNORE_FILE = STATE / ".gitleaksignore"
+UI_FILE = Path(__file__).with_name("ui.html")
+CONFIG_FILE = Path(__file__).with_name("gitleaks.toml")
+PLACEHOLDER = "<removed by secret-vacuum>"
+DOT = "\u2022"
+
+# Credential stores worth scanning by default. Personal directories
+# (~/Documents, ~/Downloads, ~/Desktop) are deliberately absent: heavy noise,
+# and no engineer's credentials belong there. Add them with --root.
+DEFAULT_ROOTS = [
+    "~/Documents/GitHub",
+    "~/.aws",
+    "~/.ssh",
+    "~/.dbt",
+    "~/.config/gcloud",
+    "~/.docker/config.json",
+    "~/.kube",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.zshrc",
+    "~/.zsh_history",
+    "~/.claude.json",
+    "~/.cursor",
+]
+
+# Rewriting shell history is its own kind of damage, so history files are
+# shown and redactable but never removable as a whole file.
+REDACT_ONLY = ("/.zsh_history", "/.bash_history")
+
+ACTIONS = ("remove", "redact", "ignore")
+
+
+def _binary(name: str) -> str:
+    """Resolve once, absolutely. A security tool should not let PATH decide which
+    scanner it runs."""
+    found = shutil.which(name)
+    if not found:
+        sys.exit(f"{name} not found on PATH. Install it first: brew install {name}")
+    return found
+
+# Files that exist only to hold credentials: removing the whole thing is right.
+# Anything else is a file you still want, so the default is to redact the line.
+CREDENTIAL_FILES = re.compile(
+    r"(^|/)(\.env[^/]*|\.netrc|\.npmrc|\.pypirc|credentials|id_[a-z0-9]+|[^/]+\.(pem|key|p12|pfx|jks))$"
+)
+
+
+# --------------------------------------------------------------------------- model
+
+
+@dataclass
+class Finding:
+    """One gitleaks hit. `secret` lives in memory for the lifetime of the run and
+    is never serialized -- `public()` is the only thing the UI or disk ever sees."""
+
+    fingerprint: str
+    path: str
+    rule: str
+    description: str
+    start_line: int
+    end_line: int
+    entropy: float
+    secret: str = field(repr=False)
+    tracked: bool = False
+
+    @property
+    def sha8(self) -> str:
+        """Not reversible, and stable across runs -- safe to show and to record."""
+        return hashlib.sha256(self.secret.encode()).hexdigest()[:8]
+
+    @property
+    def suggested(self) -> str:
+        """Pre-selected action. Never destructive by surprise: whole-file removal is
+        only the default for files that are nothing but credential."""
+        return "remove" if self.removable and CREDENTIAL_FILES.search(self.path) else "redact"
+
+    @property
+    def removable(self) -> bool:
+        return not self.path.endswith(REDACT_ONLY)
+
+    def public(self) -> dict:
+        return {
+            "fingerprint": self.fingerprint,
+            "path": self.path,
+            "display": display_path(self.path),
+            "rule": self.rule,
+            "description": self.description,
+            "line": self.start_line,
+            "lines": self.end_line - self.start_line + 1,
+            "entropy": round(self.entropy, 2),
+            "sha8": self.sha8,
+            "masked": mask(self.secret),
+            "length": len(self.secret),
+            "tracked": self.tracked,
+            "removable": self.removable,
+            "suggested": self.suggested,
+        }
+
+
+def mask(value: str) -> str:
+    """First four and last four. You should not need to read a secret to decide on it."""
+    v = value.strip()
+    return DOT * len(v) if len(v) <= 12 else v[:4] + DOT * 6 + v[-4:]
+
+
+def display_path(path: str) -> str:
+    try:
+        return "~/" + str(Path(path).relative_to(HOME))
+    except ValueError:
+        return path
+
+
+# --------------------------------------------------------------------------- scan
+
+
+@functools.lru_cache(maxsize=None)
+def git_tracked(path: str) -> bool:
+    """True if git has this file committed, which means deleting it here does not
+    unleak it -- the value is in every clone and needs rotating instead."""
+    p = Path(path)
+    r = subprocess.run(
+        [_binary("git"), "-C", str(p.parent), "ls-files", "--error-unmatch", "--", p.name],
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
+
+
+@functools.lru_cache(maxsize=1)
+def gitleaks_version() -> str:
+    return subprocess.run([_binary("gitleaks"), "version"], capture_output=True,
+                          text=True).stdout.strip() or "unknown"
+
+
+def scan_root(root: Path) -> list[dict]:
+    """Report goes to stdout, so no file holding secrets is ever created."""
+    cmd = [
+        _binary("gitleaks"), "dir", str(root),
+        "--report-format", "json", "--report-path", "-",
+        "--no-banner", "--log-level", "error", "--exit-code", "0",
+        "--max-target-megabytes", "10",
+        # Explicit config, so a scanned repo's own .gitleaks.toml cannot
+        # allowlist away its leaks behind our back.
+        "--config", str(CONFIG_FILE),
+    ]
+    if IGNORE_FILE.exists():
+        cmd += ["--gitleaks-ignore-path", str(IGNORE_FILE)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = r.stdout.strip()
+    if not out.startswith("["):
+        # A scanner that failed must never read as "nothing found" in a tool whose
+        # whole job is finding things.
+        raise RuntimeError(f"gitleaks failed on {root}: {(r.stderr or out).strip()[:400]}")
+    return json.loads(out)
+
+
+def scan(roots: list[str]) -> list[Finding]:
+    paths = [p for p in (Path(r).expanduser() for r in roots) if p.exists()]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        raw = [hit for batch in pool.map(scan_root, paths) for hit in batch]
+
+    found: dict[str, Finding] = {}
+    for h in raw:
+        path = h.get("SymlinkFile") or h["File"]
+        f = Finding(
+            fingerprint=h["Fingerprint"],
+            path=path,
+            rule=h["RuleID"],
+            description=h["Description"],
+            start_line=h["StartLine"],
+            end_line=h["EndLine"],
+            entropy=h.get("Entropy", 0.0),
+            secret=h["Secret"],
+        )
+        found.setdefault(f.fingerprint, f)
+
+    for f in found.values():
+        f.tracked = git_tracked(f.path)
+    return sorted(found.values(), key=lambda f: (not f.tracked, f.path, f.start_line))
+
+
+# --------------------------------------------------------------------------- actions
+
+
+def _batch_dir() -> Path:
+    d = TRASH / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    (d / "files").mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _stash(batch: Path, src: Path) -> Path:
+    """Copy a file into the batch preserving its absolute path, so undo is a reversal."""
+    dest = batch / "files" / str(src).lstrip("/")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    return dest
+
+
+def redact_lines(lines: list[str], f: Finding) -> tuple[list[str], bool]:
+    """Replace the secret inside its own line. Locating it by value rather than by
+    gitleaks' column offsets keeps this exact and self-validating: if the value is
+    not on the line any more, we refuse instead of corrupting the file."""
+    lo, hi = f.start_line - 1, f.end_line
+    if not 0 <= lo < len(lines):
+        return lines, False
+    out = list(lines)
+    if f.end_line > f.start_line:  # multi-line, e.g. a PEM block
+        out[lo:hi] = [f"{PLACEHOLDER}\n"]
+        return out, True
+    if f.secret not in out[lo]:
+        return lines, False
+    out[lo] = out[lo].replace(f.secret, PLACEHOLDER)
+    return out, True
+
+
+def apply_actions(findings: dict[str, Finding], requested: list[dict]) -> dict:
+    """One trash batch per call. Removals win over redactions on the same file."""
+    chosen = [
+        (findings[r["fingerprint"]], r["action"])
+        for r in requested
+        if r.get("fingerprint") in findings and r.get("action") in ACTIONS
+    ]
+    remove = {f.path for f, a in chosen if a == "remove" and f.removable}
+    results, entries = [], []
+    batch = _batch_dir() if any(a != "ignore" for _, a in chosen) else None
+
+    # Redact first: a file also queued for removal is skipped, not double-handled.
+    by_file: dict[str, list[Finding]] = {}
+    for f, a in chosen:
+        if a == "redact" and f.path not in remove:
+            by_file.setdefault(f.path, []).append(f)
+
+    for path, group in by_file.items():
+        src = Path(path)
+        if not src.is_file():
+            results += [{"fingerprint": f.fingerprint, "ok": False, "detail": "file is gone"} for f in group]
+            continue
+        _stash(batch, src)
+        lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+        for f in sorted(group, key=lambda f: -f.start_line):
+            lines, ok = redact_lines(lines, f)
+            results.append({
+                "fingerprint": f.fingerprint, "ok": ok,
+                "detail": "redacted" if ok else "value no longer on that line, left alone",
+            })
+            if ok:
+                entries.append({"path": path, "action": "redact", "rule": f.rule,
+                                "sha8": f.sha8, "line": f.start_line})
+        src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
+
+    for f, a in chosen:
+        if a == "remove":
+            if not f.removable:
+                results.append({"fingerprint": f.fingerprint, "ok": False,
+                                "detail": "history file: redact instead of removing"})
+            elif not Path(f.path).exists():
+                results.append({"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"})
+            else:
+                dest = batch / "files" / f.path.lstrip("/")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(f.path, dest)  # move, never unlink
+                entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
+                results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
+        elif a == "ignore":
+            add_ignore(f.fingerprint)
+            results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
+
+    if batch:
+        # Paths, rule ids and hashes only. No secret value reaches this file.
+        (batch / "manifest.json").write_text(
+            json.dumps({"created": datetime.now(timezone.utc).isoformat(), "entries": entries}, indent=1)
+        )
+        if not entries:
+            shutil.rmtree(batch, ignore_errors=True)
+            batch = None
+    return {"batch": batch.name if batch else None, "results": results}
+
+
+def add_ignore(fingerprint: str) -> None:
+    """gitleaks' own ignore format: fingerprints, never values."""
+    IGNORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    current = IGNORE_FILE.read_text().splitlines() if IGNORE_FILE.exists() else []
+    if fingerprint not in current:
+        with IGNORE_FILE.open("a") as fh:
+            fh.write(fingerprint + "\n")
+
+
+def batches() -> list[Path]:
+    if not TRASH.exists():
+        return []
+    return sorted((d for d in TRASH.iterdir() if d.is_dir() and not d.name.endswith(".restored")))
+
+
+def undo(batch: Path | None = None) -> dict:
+    """Put a batch back where it came from. Restoring marks the batch so a second
+    undo moves to the one before it rather than replaying the same one."""
+    batch = batch or (batches()[-1] if batches() else None)
+    if not batch:
+        return {"ok": False, "detail": "nothing in the trash"}
+    files = batch / "files"
+    restored = 0
+    for src in sorted(files.rglob("*")):
+        if src.is_file():
+            dest = Path("/") / src.relative_to(files)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            restored += 1
+    batch.rename(batch.with_name(batch.name + ".restored"))
+    return {"ok": True, "detail": f"restored {restored} file(s) from {batch.name}"}
+
+
+# --------------------------------------------------------------------------- server
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "secret-vacuum"
+    state: dict = {}
+
+    # The URL carries the token, and the default handler logs every URL to stderr.
+    def log_message(self, *_args):  # noqa: D102
+        pass
+
+    def _authorized(self) -> bool:
+        port = self.state["port"]
+        if (self.headers.get("Host") or "") != f"127.0.0.1:{port}":
+            return False  # DNS-rebinding guard: only the literal loopback host
+        origin = self.headers.get("Origin")
+        if origin and origin != f"http://127.0.0.1:{port}":
+            return False
+        sent = self.headers.get("X-SV-Token") or parse_qs(urlparse(self.path).query).get("t", [""])[0]
+        return hmac.compare_digest(sent, self.state["token"])
+
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()  # no CORS header is ever emitted
+        self.wfile.write(body)
+
+    def _json(self, payload: dict, code: int = 200) -> None:
+        self._send(code, json.dumps(payload).encode(), "application/json")
+
+    def do_GET(self) -> None:  # noqa: N802
+        if not self._authorized():
+            return self._send(403, b"forbidden", "text/plain")
+        route = urlparse(self.path).path
+        if route == "/":
+            return self._send(200, UI_FILE.read_bytes(), "text/html; charset=utf-8")
+        if route == "/api/findings":
+            return self._json(self.snapshot())
+        self._send(404, b"not found", "text/plain")
+
+    def do_POST(self) -> None:  # noqa: N802
+        if not self._authorized():
+            return self._send(403, b"forbidden", "text/plain")
+        route = urlparse(self.path).path
+        if route == "/api/rescan":
+            self.state["findings"] = {f.fingerprint: f for f in scan(self.state["roots"])}
+            self.state["scanned_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            return self._json(self.snapshot())
+        if not self.state["apply"]:
+            return self._json({"error": "preview mode: restart with --apply to make changes"}, 403)
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        if route == "/api/apply":
+            out = apply_actions(self.state["findings"], body.get("actions", []))
+        elif route == "/api/undo":
+            out = undo()
+        else:
+            return self._send(404, b"not found", "text/plain")
+        # Handled findings stay in the list so the UI can show what happened to
+        # each one. Rescan is what clears them.
+        self._json({**out, **self.snapshot()})
+
+    def snapshot(self) -> dict:
+        return {
+            "findings": [f.public() for f in self.state["findings"].values()],
+            "apply": self.state["apply"],
+            "roots": [display_path(r) for r in self.state["roots"]],
+            "scanned_at": self.state["scanned_at"],
+            "gitleaks": self.state["gitleaks"],
+            "batches": [b.name for b in batches()],
+        }
+
+
+def serve(findings: list[Finding], roots: list[str], apply_mode: bool, open_browser: bool = True) -> str:
+    Handler.state = {
+        "findings": {f.fingerprint: f for f in findings},
+        "roots": roots,
+        "apply": apply_mode,
+        "token": secrets.token_urlsafe(32),
+        "scanned_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "gitleaks": gitleaks_version(),
+        "port": 0,
+    }
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)  # loopback only
+    Handler.state["port"] = httpd.server_address[1]
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/?t={Handler.state['token']}"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    # flush: the URL must reach a pipe immediately, not sit in a block buffer
+    print(f"  {'APPLY - changes are live' if apply_mode else 'PREVIEW - read only, --apply to enable changes'}")
+    print(f"  {url}\n  ctrl-c to stop", flush=True)
+    if open_browser:
+        webbrowser.open(url)
+    return url
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def print_table(findings: list[Finding]) -> None:
+    if not findings:
+        print("No secrets found.")
+        return
+    width = min(max(len(display_path(f.path)) for f in findings), 58)
+    print(f"{'FILE':<{width}}  {'LINE':>5}  {'RULE':<24}  {'VALUE':<18}  FLAGS")
+    for f in findings:
+        flags = "committed" if f.tracked else ""
+        print(f"{display_path(f.path)[-width:]:<{width}}  {f.start_line:>5}  "
+              f"{f.rule[:24]:<24}  {mask(f.secret):<18}  {flags}")
+    tracked = sum(f.tracked for f in findings)
+    print(f"\n{len(findings)} finding(s), {tracked} committed to a repo (rotate those, deleting the file "
+          f"does not unleak them).")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="secret-vacuum", description=__doc__.splitlines()[0])
+    ap.add_argument("command", nargs="?", default="ui", choices=("ui", "scan", "undo"))
+    ap.add_argument("--root", action="append", default=[], metavar="PATH",
+                    help="scan this path instead of the defaults (repeatable)")
+    ap.add_argument("--apply", action="store_true", help="allow changes; without it the UI is read only")
+    ap.add_argument("--json", action="store_true", help="with scan: emit findings as JSON (masked, never values)")
+    ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    a = ap.parse_args(argv)
+
+    if a.command == "undo":
+        r = undo()
+        print(r["detail"])
+        return 0 if r["ok"] else 1
+
+    roots = a.root or DEFAULT_ROOTS
+    if not (a.command == "scan" and a.json):
+        print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
+    findings = scan(roots)
+
+    if a.command == "scan":
+        if a.json:
+            print(json.dumps([f.public() for f in findings], indent=1))
+        else:
+            print_table(findings)
+        return 0
+
+    serve(findings, roots, a.apply, open_browser=not a.no_browser)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
