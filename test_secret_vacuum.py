@@ -719,6 +719,31 @@ def test_an_empty_batch_is_not_treated_as_restorable(tmp_path: Path):
     assert sv.undo()["ok"] and target.exists()
 
 
+def test_an_oserror_from_the_scanner_is_a_failure_not_a_crash(tmp_path: Path):
+    """The binary is resolved once, so it can vanish or lose its execute bit before
+    it runs. subprocess.run then raises OSError, which is not a RuntimeError."""
+    sandbox(tmp_path)
+    (tmp_path / "s.env").write_text(f"k = {FAKE_AWS_ID}\n")
+
+    real_run = subprocess.run
+
+    def gone(cmd, **kw):
+        if "gitleaks" in cmd[0] and "dir" in cmd:
+            raise OSError(8, "Exec format error")
+        return real_run(cmd, **kw)
+
+    sv.subprocess.run = gone
+    try:
+        raised = False
+        try:
+            sv.scan([str(tmp_path)])
+        except RuntimeError as e:
+            raised = "could not run gitleaks" in str(e)
+        assert raised, "an OSError must surface as a scan failure, not escape the scan"
+    finally:
+        sv.subprocess.run = real_run
+
+
 def test_one_bad_root_does_not_discard_the_others(tmp_path: Path):
     """A permission error on one root must not throw away what every other root
     found, and must not pass unnoticed either."""

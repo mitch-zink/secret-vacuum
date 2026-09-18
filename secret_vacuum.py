@@ -265,7 +265,12 @@ def scan_root(root: Path) -> list[dict]:
     ]
     if IGNORE_FILE.exists():
         cmd += ["--gitleaks-ignore-path", str(IGNORE_FILE)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        # The binary was there when we resolved it and is not now, or cannot be
+        # executed. Same contract as any other scan failure: loud, not empty.
+        raise RuntimeError(f"could not run gitleaks for {root}: {e}") from None
     out = r.stdout.strip()
     # Success is the exit code, not the shape of stdout. With --exit-code 0 gitleaks
     # returns 0 for a completed scan whether or not it found anything, and non-zero
@@ -304,7 +309,7 @@ def scan(roots: list[str], progress: bool = False,
             root = display_path(str(futures[future]))
             try:
                 hits = future.result()
-            except RuntimeError as e:
+            except (RuntimeError, OSError) as e:
                 # One unreadable root must not throw away what the others found,
                 # but it must not pass unnoticed either.
                 failures.append(f"{root}: {e}")
