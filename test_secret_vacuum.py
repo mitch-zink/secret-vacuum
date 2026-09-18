@@ -202,6 +202,21 @@ def test_two_secrets_in_one_file_both_report_success(tmp_path: Path):
     assert sv.undo()["ok"] and target.exists()
 
 
+def test_a_group_containing_a_history_file_cannot_be_removed_wholesale(tmp_path: Path):
+    """One value in both a .env and ~/.zsh_history: the group must not offer to
+    delete the history file just because the .env would be safe to delete."""
+    mixed = sv.group_findings([finding("/h/proj/.env", FAKE_STRIPE),
+                               finding("/h/.zsh_history", FAKE_STRIPE)])[0]
+    assert mixed.removable is False and mixed.suggested == "redact"
+
+    pure = sv.group_findings([finding("/h/a/.env", FAKE_STRIPE),
+                              finding("/h/b/.env", FAKE_STRIPE)])[0]
+    assert pure.removable is True and pure.suggested == "remove"
+
+    config = sv.group_findings([finding("/h/.cursor/settings.json", FAKE_STRIPE)])[0]
+    assert config.removable is True and config.suggested == "redact"
+
+
 # --------------------------------------------------------------- redaction is surgical
 
 
