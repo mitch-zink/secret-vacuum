@@ -91,10 +91,13 @@ MUTATE = threading.Lock()
 
 def _binary(name: str) -> str:
     """Resolve once, absolutely. A security tool should not let PATH decide which
-    scanner it runs."""
+    scanner it runs. Raises rather than exiting: this is called from worker
+    threads and from request handlers, where sys.exit would surface as a
+    traceback instead of the message. FileNotFoundError is an OSError, so the
+    scan-failure handlers already cover it."""
     found = shutil.which(name)
     if not found:
-        sys.exit(f"{name} not found on PATH. Install it first: brew install {name}")
+        raise FileNotFoundError(f"{name} not found on PATH. Install it first: brew install {name}")
     return found
 
 # Files that exist only to hold credentials: removing the whole thing is right.
@@ -612,6 +615,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(payload).encode(), "application/json")
 
     def do_GET(self) -> None:  # noqa: N802
+        self._guard(self._get)
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._guard(self._post)
+
+    def _guard(self, handler) -> None:
+        """Answer every request, even a failing one. Anything reaching here is a
+        filesystem error the route did not expect."""
+        try:
+            handler()
+        except OSError as e:
+            self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+
+    def _get(self) -> None:
         if not self._authorized():
             return self._send(403, b"forbidden", "text/plain")
         route = urlparse(self.path).path
@@ -621,7 +638,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self.snapshot())
         self._send(404, b"not found", "text/plain")
 
-    def do_POST(self) -> None:  # noqa: N802
+    def _post(self) -> None:
         if not self._authorized():
             return self._send(403, b"forbidden", "text/plain")
         route = urlparse(self.path).path
@@ -630,11 +647,13 @@ class Handler(BaseHTTPRequestHandler):
             failures: list[str] = []
             try:
                 found = scan(self.state["roots"], failures=failures)
-            except RuntimeError as e:
-                # scan raises when no root could be read at all. Answer with the
-                # reason rather than dropping the connection.
+                groups = {g.key: g for g in group_findings(found)}
+            except (RuntimeError, OSError) as e:
+                # scan raises when no root could be read at all, and grouping
+                # shells out to git. Answer with the reason rather than dropping
+                # the connection.
                 return self._json({"error": f"scan failed: {e}", **self.snapshot()}, 503)
-            self.state["groups"] = {g.key: g for g in group_findings(found)}
+            self.state["groups"] = groups
             self.state["failures"] = failures
             self.state["scanned_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             return self._json(self.snapshot())
@@ -736,14 +755,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if r["ok"] else 1
 
     roots = a.root or DEFAULT_ROOTS
-    if not (a.command == "scan" and a.json):
-        print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
     failures: list[str] = []
     try:
+        if not (a.command == "scan" and a.json):
+            print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
         findings = scan(roots, progress=not (a.command == "scan" and a.json),
                         failures=failures)
-    except RuntimeError as e:
-        # Every root failed. Say why, rather than printing a traceback.
+    except (RuntimeError, OSError) as e:
+        # Every root failed, or the scanner is not installed at all. Say why,
+        # rather than printing a traceback.
         return print(f"scan failed: {e}", file=sys.stderr) or 2
 
     if a.command == "scan":

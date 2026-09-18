@@ -994,6 +994,60 @@ def test_tracked_files_are_flagged_as_committed(tmp_path: Path):
     assert by_name["loose.env"].tracked is False
 
 
+def test_a_missing_binary_raises_instead_of_exiting_the_process():
+    """_binary runs inside worker threads and inside request handlers. sys.exit
+    there raises SystemExit, which the scan loop does not catch (it is not an
+    Exception) and which kills the caller with a traceback instead of a message."""
+    try:
+        sv._binary("secret-vacuum-no-such-binary")
+    except SystemExit:
+        raise AssertionError("sys.exit from a worker thread does not exit cleanly")
+    except FileNotFoundError as e:
+        assert "not found on PATH" in str(e)
+    else:
+        raise AssertionError("a missing binary must fail")
+
+
+def test_a_missing_scanner_reads_as_a_scan_failure(tmp_path: Path):
+    """gitleaks absent must surface as the same loud scan failure as any other,
+    never as an empty result and never as a SystemExit out of a worker."""
+    sandbox(tmp_path)
+    (tmp_path / "s.env").write_text(f"k = {FAKE_AWS_ID}\n")
+    real_which = sv.shutil.which
+    sv.shutil.which = lambda n: None if n == "gitleaks" else real_which(n)
+    try:
+        detail = ""
+        try:
+            sv.scan([str(tmp_path)])
+        except SystemExit:
+            raise AssertionError("a worker thread must not try to exit the process")
+        except RuntimeError as e:
+            detail = str(e)
+        assert "gitleaks not found on PATH" in detail, detail
+    finally:
+        sv.shutil.which = real_which
+
+
+def test_a_filesystem_error_in_a_route_answers_the_request():
+    """Every route touches the filesystem. A handler that raises OSError without
+    the guard drops the connection, so the UI shows nothing at all -- including
+    after a partial apply that already moved files into the trash."""
+    sent = {}
+
+    class Stub:
+        _guard = sv.Handler._guard
+
+        def _json(self, payload, code=200):
+            sent.update(payload=payload, code=code)
+
+    def boom():
+        raise PermissionError(13, "Permission denied")
+
+    Stub()._guard(boom)
+    assert sent["code"] == 500, sent
+    assert "PermissionError" in sent["payload"]["error"], sent
+
+
 # --------------------------------------------------------------- runner
 
 
