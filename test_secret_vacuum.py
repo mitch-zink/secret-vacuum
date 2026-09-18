@@ -144,7 +144,13 @@ def test_remove_wins_over_redact_on_the_same_file(tmp_path: Path):
         {"key": b.sha8, "action": "redact"},
     ])
     assert not target.exists()
-    assert sum(r["ok"] for r in out["results"]) == 1
+    # The redaction never ran, but its value went with the file, so both selected
+    # groups must report an outcome. A row that silently shows nothing reads as
+    # "the tool ignored me" when the secret is in fact gone.
+    assert {r["key"] for r in out["results"]} == set(groups)
+    assert all(r["ok"] for r in out["results"]), out["results"]
+
+    assert sv.undo()["ok"] and target.exists()
 
 
 def test_one_value_in_many_places_is_one_row_and_one_action(tmp_path: Path):
@@ -215,6 +221,41 @@ def test_a_group_containing_a_history_file_cannot_be_removed_wholesale(tmp_path:
 
     config = sv.group_findings([finding("/h/.cursor/settings.json", FAKE_STRIPE)])[0]
     assert config.removable is True and config.suggested == "redact"
+
+
+def test_every_selected_group_gets_an_outcome(tmp_path: Path):
+    """Whatever combination is applied, no row may come back with nothing. A blank
+    result reads as "the tool ignored me" even when the secret is gone."""
+    sandbox(tmp_path)
+    keep = tmp_path / "rc"
+    keep.write_text(f"export K={FAKE_STRIPE}\n")
+    creds = tmp_path / "svc" / ".env"
+    creds.parent.mkdir()
+    creds.write_text(f"A={FAKE_AWS_ID}\nB={FAKE_AWS_SECRET}\n")
+    hist = tmp_path / ".zsh_history"
+    hist.write_text(f"curl -H 'x: {FAKE_AWS_SECRET}'\n")
+
+    findings = [
+        finding(str(keep), FAKE_STRIPE, 1),
+        finding(str(creds), FAKE_AWS_ID, 1),
+        finding(str(creds), FAKE_AWS_SECRET, 2),
+        finding(str(hist), FAKE_AWS_SECRET, 1),
+    ]
+    for i, f in enumerate(findings):
+        f.fingerprint += f":{i}"
+    groups = {g.key: g for g in sv.group_findings(findings)}
+
+    for actions in (["remove"] * len(groups), ["redact"] * len(groups),
+                    ["remove", "redact", "ignore"][: len(groups)]):
+        sandbox(tmp_path / f"state-{'-'.join(actions)}")
+        keep.write_text(f"export K={FAKE_STRIPE}\n")
+        creds.write_text(f"A={FAKE_AWS_ID}\nB={FAKE_AWS_SECRET}\n")
+        hist.write_text(f"curl -H 'x: {FAKE_AWS_SECRET}'\n")
+        req = [{"key": k, "action": a} for k, a in zip(groups, actions)]
+        out = sv.apply_actions(groups, req)
+        assert {r["key"] for r in out["results"]} == {r["key"] for r in req}, (
+            f"missing outcomes for {actions}: {out['results']}"
+        )
 
 
 # --------------------------------------------------------------- redaction is surgical

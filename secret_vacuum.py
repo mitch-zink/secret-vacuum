@@ -393,6 +393,16 @@ def apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
             add_ignore(f.fingerprint)
             results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
 
+    # A redaction on a file that was also removed never ran, but the value went with
+    # the file. Say so, rather than leaving that row with no outcome at all.
+    for f, a in chosen:
+        if a == "redact" and f.path in remove:
+            gone = f.path in moved
+            results.append({
+                "fingerprint": f.fingerprint, "ok": gone,
+                "detail": "removed with the file" if gone else "the file could not be removed",
+            })
+
     rolled: dict[str, dict] = {}
     for r in results:
         key = owner.get(r["fingerprint"])
