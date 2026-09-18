@@ -566,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.command == "scan":
         if a.json:
-            print(json.dumps([f.public() for f in findings], indent=1))
+            print(json.dumps([g.public() for g in group_findings(findings)], indent=1))
         else:
             print_table(findings)
         return 0

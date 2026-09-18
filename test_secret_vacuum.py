@@ -8,6 +8,8 @@ trip a secret scanner. Nothing here is a real credential.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import shutil
 import subprocess
@@ -329,6 +331,25 @@ def request_raw(req) -> tuple[int, str]:
             return r.status, r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
+
+
+def test_scan_json_output_is_grouped_and_carries_no_values(tmp_path: Path):
+    """--json is the scriptable surface, so it must agree with the table and stay clean."""
+    sandbox(tmp_path)
+    for tree in ("a", "b"):
+        f = tmp_path / tree / ".env"
+        f.parent.mkdir()
+        f.write_text(f"K={FAKE_STRIPE}\n")
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        sv.main(["scan", "--json", "--root", str(tmp_path)])
+    payload = out.getvalue()
+
+    groups = json.loads(payload)
+    assert len(groups) == 1 and groups[0]["copies"] == 2
+    assert FAKE_STRIPE not in payload
+    assert "key" in groups[0] and "paths" in groups[0]
 
 
 # --------------------------------------------------------------- guarantee 4: no network
