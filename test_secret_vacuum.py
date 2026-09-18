@@ -562,6 +562,37 @@ def test_vendored_content_and_placeholders_are_not_reported(tmp_path: Path):
     )
 
 
+def test_every_location_is_reported_not_a_sample(tmp_path: Path):
+    """paths was capped at 40 entries. The UI said "and N more", but --json is a
+    machine surface and silently dropped the rest, so a caller piping it into
+    automation would miss locations that are really there."""
+    sandbox(tmp_path)
+    for i in range(45):
+        f = tmp_path / f"copy{i:03d}" / ".env"
+        f.parent.mkdir()
+        f.write_text(f"K={FAKE_STRIPE}\n")
+
+    group = sv.group_findings(sv.scan([str(tmp_path)]))[0]
+    pub = group.public()
+    assert pub["copies"] == 45
+    assert len(pub["paths"]) == 45, f"all locations must be listed, got {len(pub['paths'])}"
+    assert FAKE_STRIPE not in json.dumps(pub)
+
+
+def test_all_shell_startup_files_are_scanned(tmp_path: Path):
+    """An exported token lives in whichever startup file set it. Only ~/.zshrc was
+    covered, so a token exported from ~/.zprofile was invisible."""
+    roots = set(sv.DEFAULT_ROOTS)
+    for rc in ("~/.zshrc", "~/.zshenv", "~/.zprofile", "~/.zlogin", "~/.bashrc",
+               "~/.bash_profile", "~/.bash_login", "~/.profile",
+               "~/.config/fish/config.fish"):
+        assert rc in roots, f"{rc} is a place an export can hide"
+    for hist in ("~/.zsh_history", "~/.bash_history"):
+        assert hist in roots
+        assert not sv.Finding("f", str(Path.home() / hist[2:]), "r", "d", 1, 1, 0.0,
+                              FAKE_STRIPE).removable, "history stays redact-only"
+
+
 # --------------------------------------------------------------- guarantee 3: server is locked down
 
 
@@ -707,9 +738,10 @@ def test_one_bad_root_does_not_discard_the_others(tmp_path: Path):
 
     sv.scan_root = flaky
     try:
-        found = sv.scan([str(good), str(bad)])
+        failures: list[str] = []
+        found = sv.scan([str(good), str(bad)], failures=failures)
         assert len(found) == 1, "the healthy root's findings survive"
-        assert sv.SCAN_FAILURES and "bad" in sv.SCAN_FAILURES[0], "the failure is recorded"
+        assert failures and "bad" in failures[0], "the failure is reported to the caller"
     finally:
         sv.scan_root = real_root
 
@@ -770,6 +802,67 @@ def test_the_cli_reports_a_total_scan_failure_instead_of_a_traceback(tmp_path: P
     finally:
         sv.scan_root = real_root
     assert code == 2 and "scan failed" in err.getvalue()
+
+
+def test_roots_that_do_not_exist_are_an_error_not_a_clean_bill(tmp_path: Path):
+    """A typo in --root returned [], which reads as "your machine is clean"."""
+    sandbox(tmp_path)
+    raised = False
+    try:
+        sv.scan([str(tmp_path / "nope"), str(tmp_path / "also-nope")])
+    except RuntimeError as e:
+        raised = "none of the requested roots exist" in str(e)
+    assert raised
+
+    # A root that is simply absent among others that are present is fine: the
+    # defaults list many paths that only some machines have.
+    real = tmp_path / "here"
+    real.mkdir()
+    (real / "svc.env").write_text(f"k = {FAKE_AWS_ID}\n")
+    assert len(sv.scan([str(real), str(tmp_path / "missing")])) == 1
+
+    assert sv.scan([]) == [], "no roots requested at all is not an error"
+
+
+def test_concurrent_scans_do_not_clobber_each_others_failures(tmp_path: Path):
+    """Failures used to live in a module global, so one scan clearing it while
+    another was mid-flight lost the other's result. Each caller owns its list."""
+    sandbox(tmp_path)
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / "s.env").write_text(f"k = {FAKE_AWS_ID}\n")
+    bad = tmp_path / "bad"
+    bad.mkdir()
+
+    real_root = sv.scan_root
+
+    def flaky(root: Path):
+        if root.name == "bad":
+            raise RuntimeError(f"gitleaks failed on {root}: boom")
+        return real_root(root)
+
+    sv.scan_root = flaky
+    errors, seen = [], []
+
+    def race():
+        mine: list[str] = []
+        try:
+            sv.scan([str(good), str(bad)], failures=mine)
+            seen.append(mine)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    try:
+        threads = [threading.Thread(target=race) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sv.scan_root = real_root
+
+    assert not errors, errors
+    assert all(len(f) == 1 for f in seen), f"each scan sees exactly its own failure: {seen}"
 
 
 # --------------------------------------------------------------- guarantee 4: no network

@@ -56,8 +56,19 @@ DEFAULT_ROOTS = [
     "~/.netrc",
     "~/.npmrc",
     "~/.pypirc",
+    # Every shell startup file, not just .zshrc: an exported token lives in
+    # whichever one set it, and the live environment has no file to remove.
     "~/.zshrc",
+    "~/.zshenv",
+    "~/.zprofile",
+    "~/.zlogin",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.bash_login",
+    "~/.profile",
+    "~/.config/fish/config.fish",
     "~/.zsh_history",
+    "~/.bash_history",
     "~/.claude.json",
     "~/.cursor",
 ]
@@ -75,7 +86,7 @@ MUTATE = threading.Lock()
 
 # Roots the last scan could not read. Surfaced in the CLI and in the UI, because a
 # root that failed is not a root that is clean.
-SCAN_FAILURES: list[str] = []
+
 
 
 def _binary(name: str) -> str:
@@ -188,7 +199,9 @@ class Group:
             "copies": len(self.members),
             "display": display_path(self.lead.path),
             "line": self.lead.start_line,
-            "paths": [f"{display_path(m.path)}:{m.start_line}" for m in self.members[:40]],
+            # Every location, not a sample. The UI scrolls them; a caller piping
+            # --json into automation must not silently lose any.
+            "paths": [f"{display_path(m.path)}:{m.start_line}" for m in self.members],
             "tracked": self.tracked,
             "tracked_copies": sum(m.tracked for m in self.members),
             "removable": self.removable,
@@ -269,13 +282,22 @@ def scan_root(root: Path) -> list[dict]:
         raise RuntimeError(f"gitleaks returned unreadable output for {root}: {e}") from None
 
 
-def scan(roots: list[str], progress: bool = False) -> list[Finding]:
+def scan(roots: list[str], progress: bool = False,
+         failures: list[str] | None = None) -> list[Finding]:
     """A first run over a developer's whole code directory takes minutes, so say
     what is happening rather than looking hung."""
-    paths = [p for p in (Path(r).expanduser() for r in roots) if p.exists()]
+    wanted = [Path(r).expanduser() for r in roots]
+    paths = [p for p in wanted if p.exists()]
+    if wanted and not paths:
+        # Nothing to scan is not the same as nothing found. Returning [] here would
+        # report a clean machine for a typo in --root.
+        raise RuntimeError("none of the requested roots exist: "
+                           + ", ".join(display_path(str(p)) for p in wanted[:8]))
+    # The caller owns this list, so two concurrent scans cannot overwrite each
+    # other's failures the way a module global did.
+    failures = [] if failures is None else failures
+    del failures[:]
     raw: list[dict] = []
-    failures: list[str] = []
-    SCAN_FAILURES.clear()
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(scan_root, p): p for p in paths}
         for done, future in enumerate(as_completed(futures), start=1):
@@ -294,7 +316,6 @@ def scan(roots: list[str], progress: bool = False) -> list[Finding]:
                 print(f"  [{done}/{len(paths)}] {root} "
                       f"({len(hits)} hit{'' if len(hits) == 1 else 's'})", flush=True)
     if failures:
-        SCAN_FAILURES.extend(failures)
         if len(failures) == len(paths):
             # Nothing was scanned at all. Returning an empty list here would read as
             # a clean machine, which is the one thing this tool must never do.
@@ -581,13 +602,15 @@ class Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path).path
         if route == "/api/rescan":
             git_tracked.cache_clear()  # a file may have been committed since the last scan
+            failures: list[str] = []
             try:
-                found = scan(self.state["roots"])
+                found = scan(self.state["roots"], failures=failures)
             except RuntimeError as e:
                 # scan raises when no root could be read at all. Answer with the
                 # reason rather than dropping the connection.
                 return self._json({"error": f"scan failed: {e}", **self.snapshot()}, 503)
             self.state["groups"] = {g.key: g for g in group_findings(found)}
+            self.state["failures"] = failures
             self.state["scanned_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             return self._json(self.snapshot())
         if not self.state["apply"]:
@@ -621,12 +644,14 @@ class Handler(BaseHTTPRequestHandler):
             "scanned_at": self.state["scanned_at"],
             "gitleaks": self.state["gitleaks"],
             "batches": [b.name for b in batches()],
-            "failures": list(SCAN_FAILURES),
+            "failures": list(self.state["failures"]),
         }
 
 
-def serve(findings: list[Finding], roots: list[str], apply_mode: bool, open_browser: bool = True) -> str:
+def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
+          open_browser: bool = True, failures: list[str] | None = None) -> str:
     Handler.state = {
+        "failures": list(failures or []),
         "groups": {g.key: g for g in group_findings(findings)},
         "roots": roots,
         "apply": apply_mode,
@@ -650,7 +675,7 @@ def serve(findings: list[Finding], roots: list[str], apply_mode: bool, open_brow
 # --------------------------------------------------------------------------- cli
 
 
-def print_table(findings: list[Finding]) -> None:
+def print_table(findings: list[Finding], failures: list[str] | None = None) -> None:
     groups = group_findings(findings)
     if not groups:
         print("No secrets found.")
@@ -659,7 +684,8 @@ def print_table(findings: list[Finding]) -> None:
     for g in groups:
         print(f"{mask(g.lead.secret):<18}  {g.lead.rule[:24]:<24}  {len(g.members):>6}  "
               f"{'committed' if g.tracked else '':<10}  {display_path(g.lead.path)[-60:]}:{g.lead.start_line}")
-    for f in SCAN_FAILURES:
+
+    for f in failures or []:
         print(f"  WARNING unscanned: {f[:200]}")
     tracked = sum(g.tracked for g in groups)
     print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
@@ -684,8 +710,10 @@ def main(argv: list[str] | None = None) -> int:
     roots = a.root or DEFAULT_ROOTS
     if not (a.command == "scan" and a.json):
         print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
+    failures: list[str] = []
     try:
-        findings = scan(roots, progress=not (a.command == "scan" and a.json))
+        findings = scan(roots, progress=not (a.command == "scan" and a.json),
+                        failures=failures)
     except RuntimeError as e:
         # Every root failed. Say why, rather than printing a traceback.
         return print(f"scan failed: {e}", file=sys.stderr) or 2
@@ -694,10 +722,10 @@ def main(argv: list[str] | None = None) -> int:
         if a.json:
             print(json.dumps([g.public() for g in group_findings(findings)], indent=1))
         else:
-            print_table(findings)
+            print_table(findings, failures)
         return 0
 
-    serve(findings, roots, a.apply, open_browser=not a.no_browser)
+    serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

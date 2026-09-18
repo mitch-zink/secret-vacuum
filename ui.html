@@ -172,8 +172,7 @@ function render() {
               ? `and ${f.copies - 1} more ${f.copies === 2 ? "copy" : "copies"} &middot; ${esc(f.description)}`
               : esc(f.description)}</div>
             ${f.copies > 1 ? `<details><summary class="more">all ${f.copies} locations</summary>
-              <div class="locs">${f.paths.map(esc).join("<br>")}${f.copies > f.paths.length
-                ? `<br>and ${f.copies - f.paths.length} more` : ""}</div></details>` : ""}</td>
+              <div class="locs">${f.paths.map(esc).join("<br>")}</div></details>` : ""}</td>
         <td class="rule">${esc(f.rule)}</td>
         <td class="num val">${f.copies}</td>
         <td>${f.tracked ? '<span class="tag committed">committed</span>' : ""}

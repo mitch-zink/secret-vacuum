@@ -82,8 +82,19 @@ should do.
 ## What gets scanned
 
 `~/Documents/GitHub`, `~/.aws`, `~/.ssh`, `~/.dbt`, `~/.config/gcloud`, `~/.docker/config.json`,
-`~/.kube`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.zshrc`, `~/.zsh_history`, `~/.claude.json`,
-`~/.cursor`.
+`~/.kube`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.claude.json`, `~/.cursor`, every shell startup
+file (`.zshrc`, `.zshenv`, `.zprofile`, `.zlogin`, `.bashrc`, `.bash_profile`, `.bash_login`,
+`.profile`, fish's `config.fish`) and both shell histories.
+
+### Exported environment variables
+
+A token in `$MY_API_TOKEN` has no file to delete, so the tool does not read the process
+environment. It scans the files that *set* those variables instead, which is where the removable
+copy lives. All the shell startup files are covered for that reason: an export hides in whichever
+one ran, not just in `.zshrc`.
+
+Redacting the line does not unset the variable in shells that are already running. Start a new
+shell, or `unset` it, once you have dealt with the file.
 
 `~/Documents`, `~/Downloads` and `~/Desktop` are deliberately off: heavy noise, and personal files
 are not where an engineer's credentials live. Add any path with `--root`, repeatable:
