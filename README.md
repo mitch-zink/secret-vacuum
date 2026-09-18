@@ -31,7 +31,7 @@ worktrees of one repo, a value pasted into three config files, a token echoed th
 logs. secret-vacuum groups findings by the value itself, so each row is one credential and the
 `copies` column says how many places it lives. An action applies to every copy.
 
-On the machine this was built against that is the difference between **2,029 rows and 118**. It is
+On the machine this was built against that is the difference between **2,036 rows and 118**. It is
 the same data either way; one of them is a list you can actually work through.
 
 Three actions per secret:
