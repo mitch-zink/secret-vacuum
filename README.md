@@ -47,9 +47,28 @@ Three actions per secret:
 
 `undo` restores the most recent batch, moving files back rather than copying them, so a restored secret does not linger in the trash as a second plaintext copy. Batches you do not undo stay until you delete them yourself.
 
-Generated and vendored trees (`node_modules`, `.venv`, `site-packages`, `dist`, `.terraform`,
-lockfiles and friends) are skipped via `gitleaks.toml`, which is passed with `--config` so a
-scanned repository's own `.gitleaks.toml` cannot allowlist away its leaks behind your back.
+## What it ignores, and why
+
+Two kinds of noise drown the real findings on a developer machine, and both are suppressed in
+`gitleaks.toml`:
+
+**Code you did not write.** `node_modules`, `.venv`, `site-packages`, `dist`, `.terraform`,
+lockfiles, and editor extension directories (`~/.cursor/extensions`, `~/.vscode/extensions`),
+downloaded plugin and skill content, and local application databases and their write-ahead logs.
+On the machine this was built against, editor extensions alone accounted for 20 findings, several
+of which were Win32 API function names.
+
+**Documentation placeholders.** `YOUR_ACCESS_TOKEN`, `<your-token>`, `CHANGEME`, `${MY_TOKEN}`,
+`1234567890abcdef` and friends. Downloaded plugin docs are full of example `curl` commands.
+
+Together that took a real dotfile scan from 36 findings to 10, and all 10 were genuine.
+
+The config is passed with `--config`, so a scanned repository's own `.gitleaks.toml` cannot
+allowlist away its leaks behind your back. Anything the shipped list gets wrong for you goes in
+`~/.secret-vacuum/.gitleaksignore` via the Ignore action.
+
+A root that cannot be scanned is reported as a failure in the UI and on the command line, never
+counted as clean. If no root can be scanned at all, the tool errors out.
 
 ## Secrets already committed to a repo
 

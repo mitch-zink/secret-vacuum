@@ -347,7 +347,7 @@ def test_a_scanner_failure_is_loud_not_an_empty_result(tmp_path: Path):
             sv.scan([str(tmp_path)])
         except RuntimeError as e:
             raised = "gitleaks failed" in str(e)
-        assert raised, "a failing scan must raise, not return []"
+        assert raised, "when every root fails, scan must raise rather than return []"
     finally:
         sv.CONFIG_FILE = original
 
@@ -528,6 +528,40 @@ def test_undo_is_safe_when_the_trash_empties_underneath_it(tmp_path: Path):
     assert target.exists()
 
 
+def test_vendored_content_and_placeholders_are_not_reported(tmp_path: Path):
+    """A real dotfile scan was 28% signal: editor extensions, downloaded plugin
+    docs and YOUR_TOKEN placeholders drowned the handful of real credentials."""
+    sandbox(tmp_path)
+
+    def put(rel: str, secret: str) -> Path:
+        f = tmp_path / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"aws_access_key_id = {secret}\n")
+        return f
+
+    # somebody else's vendored code and downloaded docs
+    for rel in (".cursor/extensions/vendor.x/extension.js",
+                ".vscode/extensions/vendor.y/lib.py",
+                ".dbt/wizard/.tmp/plugins/zoom/skills/guide.md",
+                "ext/bundled_skills/thing/SKILL.md",
+                "chats/abc/store.db-wal"):
+        put(rel, FAKE_AWS_ID)
+
+    # documentation placeholders
+    for i, ph in enumerate(("YOUR_ACCESS_TOKEN", "<your-token-here>", "CHANGEME",
+                            "REPLACE_ME", "${MY_TOKEN}", "1234567890abcdef",
+                            "xxxxxxxxxxxx")):
+        (tmp_path / f"doc{i}.md").write_text(
+            f'curl -H "Authorization: Bearer {ph}" https://api.example.com\n')
+
+    mine = put("work/service/.env", FAKE_AWS_ID)
+
+    found = sv.scan([str(tmp_path)])
+    assert [Path(f.path) for f in found] == [mine], (
+        f"only the authored credential should surface, got {[f.path for f in found]}"
+    )
+
+
 # --------------------------------------------------------------- guarantee 3: server is locked down
 
 
@@ -652,6 +686,56 @@ def test_an_empty_batch_is_not_treated_as_restorable(tmp_path: Path):
     act("remove", finding(str(target), FAKE_STRIPE))
     assert len(sv.batches()) == 1, "the stale empty one is still ignored"
     assert sv.undo()["ok"] and target.exists()
+
+
+def test_one_bad_root_does_not_discard_the_others(tmp_path: Path):
+    """A permission error on one root must not throw away what every other root
+    found, and must not pass unnoticed either."""
+    sandbox(tmp_path)
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / "svc.env").write_text(f"aws_access_key_id = {FAKE_AWS_ID}\n")
+    bad = tmp_path / "bad"
+    bad.mkdir()
+
+    real_root = sv.scan_root
+
+    def flaky(root: Path):
+        if root.name == "bad":
+            raise RuntimeError(f"gitleaks failed on {root}: boom")
+        return real_root(root)
+
+    sv.scan_root = flaky
+    try:
+        found = sv.scan([str(good), str(bad)])
+        assert len(found) == 1, "the healthy root's findings survive"
+        assert sv.SCAN_FAILURES and "bad" in sv.SCAN_FAILURES[0], "the failure is recorded"
+    finally:
+        sv.scan_root = real_root
+
+
+def test_rescan_reasks_git_so_a_committed_badge_cannot_go_stale(tmp_path: Path):
+    """git_tracked is cached for the life of the process. Without clearing it, a
+    file committed between scans keeps reporting untracked."""
+    sandbox(tmp_path)
+    repo = tmp_path / "r"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(a, cwd=repo, capture_output=True, check=True)
+    run("git", "init", "-q")
+    run("git", "config", "user.email", "t@t.test")
+    run("git", "config", "user.name", "t")
+    target = repo / "later.env"
+    target.write_text(f"k = {FAKE_STRIPE}\n")
+
+    sv.git_tracked.cache_clear()
+    assert sv.scan([str(repo)])[0].tracked is False
+
+    run("git", "add", "later.env")
+    run("git", "commit", "-q", "-m", "committed now")
+
+    assert sv.scan([str(repo)])[0].tracked is False, "the cache is why this is stale"
+    sv.git_tracked.cache_clear()  # what /api/rescan now does
+    assert sv.scan([str(repo)])[0].tracked is True
 
 
 # --------------------------------------------------------------- guarantee 4: no network

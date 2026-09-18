@@ -137,11 +137,16 @@ function render() {
   $("mode").className = "mode " + (state.apply ? "apply" : "preview");
 
   const committed = state.findings.filter((f) => f.tracked).length;
-  $("banner").innerHTML = committed
+  const failed = (state.failures || []).length
+    ? `<div class="note"><b>${state.failures.length} root(s) could not be scanned.</b>
+       A root that failed is not a root that is clean.<div class="locs">${
+         state.failures.map(esc).join("<br>")}</div></div>`
+    : "";
+  $("banner").innerHTML = failed + (committed
     ? `<div class="note"><b>${committed} of these appear in a committed file.</b> Removing the file here does
        not unleak the value. It is in every clone and in the history. Rotate those credentials.
        They are still removable; you just need to know that removing is not enough.</div>`
-    : "";
+    : "");
 
   $("tbl").hidden = rows.length === 0;
   $("empty").hidden = rows.length > 0;

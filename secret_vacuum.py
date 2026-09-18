@@ -73,6 +73,10 @@ ACTIONS = ("remove", "redact", "ignore")
 # not just for the request handler.
 MUTATE = threading.Lock()
 
+# Roots the last scan could not read. Surfaced in the CLI and in the UI, because a
+# root that failed is not a root that is clean.
+SCAN_FAILURES: list[str] = []
+
 
 def _binary(name: str) -> str:
     """Resolve once, absolutely. A security tool should not let PATH decide which
@@ -270,14 +274,35 @@ def scan(roots: list[str], progress: bool = False) -> list[Finding]:
     what is happening rather than looking hung."""
     paths = [p for p in (Path(r).expanduser() for r in roots) if p.exists()]
     raw: list[dict] = []
+    failures: list[str] = []
+    SCAN_FAILURES.clear()
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(scan_root, p): p for p in paths}
         for done, future in enumerate(as_completed(futures), start=1):
-            hits = future.result()
+            root = display_path(str(futures[future]))
+            try:
+                hits = future.result()
+            except RuntimeError as e:
+                # One unreadable root must not throw away what the others found,
+                # but it must not pass unnoticed either.
+                failures.append(f"{root}: {e}")
+                if progress:
+                    print(f"  [{done}/{len(paths)}] {root} FAILED", flush=True)
+                continue
             raw += hits
             if progress:
-                print(f"  [{done}/{len(paths)}] {display_path(str(futures[future]))} "
+                print(f"  [{done}/{len(paths)}] {root} "
                       f"({len(hits)} hit{'' if len(hits) == 1 else 's'})", flush=True)
+    if failures:
+        SCAN_FAILURES.extend(failures)
+        if len(failures) == len(paths):
+            # Nothing was scanned at all. Returning an empty list here would read as
+            # a clean machine, which is the one thing this tool must never do.
+            raise RuntimeError("; ".join(failures))
+        if progress:
+            print(f"  {len(failures)} root(s) could not be scanned:", flush=True)
+            for f in failures:
+                print(f"    {f[:200]}", flush=True)
 
     found: dict[str, Finding] = {}
     for h in raw:
@@ -555,6 +580,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, b"forbidden", "text/plain")
         route = urlparse(self.path).path
         if route == "/api/rescan":
+            git_tracked.cache_clear()  # a file may have been committed since the last scan
             self.state["groups"] = {g.key: g for g in group_findings(scan(self.state["roots"]))}
             self.state["scanned_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             return self._json(self.snapshot())
@@ -589,6 +615,7 @@ class Handler(BaseHTTPRequestHandler):
             "scanned_at": self.state["scanned_at"],
             "gitleaks": self.state["gitleaks"],
             "batches": [b.name for b in batches()],
+            "failures": list(SCAN_FAILURES),
         }
 
 
@@ -626,6 +653,8 @@ def print_table(findings: list[Finding]) -> None:
     for g in groups:
         print(f"{mask(g.lead.secret):<18}  {g.lead.rule[:24]:<24}  {len(g.members):>6}  "
               f"{'committed' if g.tracked else '':<10}  {display_path(g.lead.path)[-60:]}:{g.lead.start_line}")
+    for f in SCAN_FAILURES:
+        print(f"  WARNING unscanned: {f[:200]}")
     tracked = sum(g.tracked for g in groups)
     print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
           f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
