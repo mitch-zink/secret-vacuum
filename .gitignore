@@ -1,0 +1,13 @@
+# Never let scan output near this repo.
+*.report.json
+gitleaks-report.*
+.secret-vacuum/
+.gitleaksignore
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+screenshots/
