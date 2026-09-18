@@ -738,6 +738,40 @@ def test_rescan_reasks_git_so_a_committed_badge_cannot_go_stale(tmp_path: Path):
     assert sv.scan([str(repo)])[0].tracked is True
 
 
+def test_rescan_answers_with_an_error_when_every_root_fails(tmp_path: Path):
+    """scan raises when nothing could be read. The handler must turn that into a
+    response, not drop the connection with no reply at all."""
+    sandbox(tmp_path)
+    url = sv.serve([], [str(tmp_path)], apply_mode=True, open_browser=False)
+    base, token = url.split("/?t=")
+
+    real_root = sv.scan_root
+    sv.scan_root = lambda root: (_ for _ in ()).throw(RuntimeError("gitleaks failed: nope"))
+    try:
+        req = urllib.request.Request(base + f"/api/rescan?t={token}", data=b"{}", method="POST")
+        code, body = send(req)
+        assert code == 503, f"expected a 503, got {code}"
+        assert "scan failed" in body and "nope" in body
+    finally:
+        sv.scan_root = real_root
+
+    req = urllib.request.Request(base + f"/api/rescan?t={token}", data=b"{}", method="POST")
+    assert send(req)[0] == 200, "a healthy rescan still works afterwards"
+
+
+def test_the_cli_reports_a_total_scan_failure_instead_of_a_traceback(tmp_path: Path):
+    sandbox(tmp_path)
+    real_root = sv.scan_root
+    sv.scan_root = lambda root: (_ for _ in ()).throw(RuntimeError("gitleaks failed: nope"))
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            code = sv.main(["scan", "--root", str(tmp_path)])
+    finally:
+        sv.scan_root = real_root
+    assert code == 2 and "scan failed" in err.getvalue()
+
+
 # --------------------------------------------------------------- guarantee 4: no network
 
 

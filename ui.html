@@ -202,6 +202,11 @@ function syncApply() {
 async function load(path, body) {
   $("empty").textContent = "Scanning…";
   const data = await api(path, body);
+  if (data.error) {
+    $("empty").textContent = data.error;
+    $("empty").hidden = false;
+    if (!data.findings) return;
+  }
   if (data.results) for (const r of data.results) results[r.key] = r;
   state = data;
   render();

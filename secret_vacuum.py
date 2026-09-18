@@ -581,7 +581,13 @@ class Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path).path
         if route == "/api/rescan":
             git_tracked.cache_clear()  # a file may have been committed since the last scan
-            self.state["groups"] = {g.key: g for g in group_findings(scan(self.state["roots"]))}
+            try:
+                found = scan(self.state["roots"])
+            except RuntimeError as e:
+                # scan raises when no root could be read at all. Answer with the
+                # reason rather than dropping the connection.
+                return self._json({"error": f"scan failed: {e}", **self.snapshot()}, 503)
+            self.state["groups"] = {g.key: g for g in group_findings(found)}
             self.state["scanned_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             return self._json(self.snapshot())
         if not self.state["apply"]:
@@ -678,7 +684,11 @@ def main(argv: list[str] | None = None) -> int:
     roots = a.root or DEFAULT_ROOTS
     if not (a.command == "scan" and a.json):
         print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
-    findings = scan(roots, progress=not (a.command == "scan" and a.json))
+    try:
+        findings = scan(roots, progress=not (a.command == "scan" and a.json))
+    except RuntimeError as e:
+        # Every root failed. Say why, rather than printing a traceback.
+        return print(f"scan failed: {e}", file=sys.stderr) or 2
 
     if a.command == "scan":
         if a.json:
