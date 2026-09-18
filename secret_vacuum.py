@@ -388,11 +388,31 @@ def redact_lines(lines: list[str], f: Finding) -> tuple[list[str], bool]:
     return out, True
 
 
-def apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
+def valid_actions(requested: object) -> list[dict]:
+    """This comes off the wire, so it is checked here once rather than blowing up
+    somewhere inside the apply. Raises ValueError, which the handler turns into a
+    400; every shape that is not a list of {key, action} is rejected."""
+    if not isinstance(requested, list):
+        raise ValueError("actions must be a list")
+    checked = []
+    for r in requested:
+        if not isinstance(r, dict):
+            raise ValueError("each action must be an object")
+        key, action = r.get("key"), r.get("action")
+        if not isinstance(key, str) or not key:
+            raise ValueError("each action needs a string key")
+        if action not in ACTIONS:
+            raise ValueError(f"action must be one of {', '.join(ACTIONS)}")
+        checked.append({"key": key, "action": action})
+    return checked
+
+
+def apply_actions(groups: dict[str, Group], requested: object) -> dict:
     """One trash batch per call. Removals win over redactions on the same file.
     An action on a group applies to every copy of that value."""
+    checked = valid_actions(requested)
     with MUTATE:
-        return _apply_actions(groups, requested)
+        return _apply_actions(groups, checked)
 
 
 def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
@@ -625,7 +645,10 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._json({"error": "malformed request body"}, 400)
         if route == "/api/apply":
-            out = apply_actions(self.state["groups"], body.get("actions", []))
+            try:
+                out = apply_actions(self.state["groups"], body.get("actions"))
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
         elif route == "/api/undo":
             out = undo()
         else:

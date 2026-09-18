@@ -865,6 +865,48 @@ def test_concurrent_scans_do_not_clobber_each_others_failures(tmp_path: Path):
     assert all(len(f) == 1 for f in seen), f"each scan sees exactly its own failure: {seen}"
 
 
+MALFORMED_ACTIONS = [
+    None, "string", 42, True, {"a": 1}, [None], ["x"], [42], [[]],
+    [{}], [{"key": None}], [{"key": ""}], [{"key": "k"}],
+    [{"action": "remove"}], [{"key": "k", "action": None}],
+    [{"key": "k", "action": "rm -rf /"}], [{"key": 5, "action": "remove"}],
+    [{"key": "ok", "action": "remove"}, None],
+]
+
+
+def test_every_malformed_action_payload_is_rejected_not_crashed(tmp_path: Path):
+    """The apply endpoint takes JSON off the wire. One report was about
+    {"actions": null}; the same shape of bug covered most of these."""
+    sandbox(tmp_path)
+    for bad in MALFORMED_ACTIONS:
+        try:
+            sv.apply_actions({}, bad)
+        except ValueError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(f"{bad!r} raised {type(e).__name__}, expected ValueError") from None
+        else:
+            raise AssertionError(f"{bad!r} should not have been accepted")
+        assert not sv.MUTATE.locked(), f"the lock leaked while rejecting {bad!r}"
+
+
+def test_the_apply_endpoint_answers_400_on_a_malformed_payload(tmp_path: Path):
+    sandbox(tmp_path)
+    url = sv.serve([], [], apply_mode=True, open_browser=False)
+    base, token = url.split("/?t=")
+
+    for bad in ('{"actions": null}', '{"actions": "nope"}', '{"actions": [null]}',
+                '{"actions": [{"key": "k", "action": "sudo"}]}', "{}"):
+        req = urllib.request.Request(base + f"/api/apply?t={token}",
+                                     data=bad.encode(), method="POST")
+        code, body = send(req)
+        assert code == 400, f"{bad} should be a 400, got {code} {body[:120]}"
+
+    req = urllib.request.Request(base + f"/api/apply?t={token}",
+                                 data=b'{"actions": []}', method="POST")
+    assert send(req)[0] == 200, "an empty action list is valid and does nothing"
+
+
 # --------------------------------------------------------------- guarantee 4: no network
 
 
