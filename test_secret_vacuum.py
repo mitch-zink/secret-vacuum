@@ -307,6 +307,30 @@ def test_server_never_emits_a_cors_header(tmp_path: Path):
         assert r.headers["Cache-Control"] == "no-store"
 
 
+def test_malformed_and_oversized_requests_are_refused_not_crashed(tmp_path: Path):
+    sandbox(tmp_path)
+    url = sv.serve([], [], apply_mode=True, open_browser=False)
+    base, token = url.split("/?t=")
+
+    req = urllib.request.Request(base + f"/api/apply?t={token}", data=b"not json", method="POST")
+    assert request_raw(req)[0] == 400
+
+    req = urllib.request.Request(base + f"/api/apply?t={token}", data=b'"a string"', method="POST")
+    assert request_raw(req)[0] == 400
+
+    req = urllib.request.Request(base + f"/api/apply?t={token}", method="POST",
+                                 data=b"{}", headers={"Content-Length": "2000000"})
+    assert request_raw(req)[0] == 413
+
+
+def request_raw(req) -> tuple[int, str]:
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
 # --------------------------------------------------------------- guarantee 4: no network
 
 

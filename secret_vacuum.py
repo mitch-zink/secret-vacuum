@@ -473,7 +473,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self.snapshot())
         if not self.state["apply"]:
             return self._json({"error": "preview mode: restart with --apply to make changes"}, 403)
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 1_000_000:
+            return self._json({"error": "request too large"}, 413)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self._json({"error": "malformed request body"}, 400)
+        if not isinstance(body, dict):
+            return self._json({"error": "malformed request body"}, 400)
         if route == "/api/apply":
             out = apply_actions(self.state["groups"], body.get("actions", []))
         elif route == "/api/undo":
