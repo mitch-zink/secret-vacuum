@@ -102,6 +102,10 @@
 <script>
 const TOKEN = new URLSearchParams(location.search).get("t") || "";
 const $ = (id) => document.getElementById(id);
+// Paths and rule text come off the filesystem, so a crafted filename must not
+// become markup. Everything interpolated into innerHTML goes through this.
+const esc = (v) =>
+  String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 let state = { findings: [], apply: false }, results = {};
 
 const api = async (path, body) => {
@@ -157,20 +161,20 @@ function render() {
         .join("");
       return `<tr class="${r && r.ok ? "gone" : ""}">
         <td><input type="checkbox" class="pick" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}></td>
-        <td class="hide val" title="${f.length} chars">${f.masked}</td>
-        <td><div class="path">${f.display}:${f.line}</div>
+        <td class="hide val" title="${f.length} chars">${esc(f.masked)}</td>
+        <td><div class="path">${esc(f.display)}:${f.line}</div>
             <div class="rule">${f.copies > 1
-              ? `and ${f.copies - 1} more copy${f.copies > 2 ? "ies" : ""} &middot; ${f.description}`
-              : f.description}</div>
+              ? `and ${f.copies - 1} more ${f.copies === 2 ? "copy" : "copies"} &middot; ${esc(f.description)}`
+              : esc(f.description)}</div>
             ${f.copies > 1 ? `<details><summary class="more">all ${f.copies} locations</summary>
-              <div class="locs">${f.paths.join("<br>")}${f.copies > f.paths.length
+              <div class="locs">${f.paths.map(esc).join("<br>")}${f.copies > f.paths.length
                 ? `<br>and ${f.copies - f.paths.length} more` : ""}</div></details>` : ""}</td>
-        <td class="rule">${f.rule}</td>
+        <td class="rule">${esc(f.rule)}</td>
         <td class="num val">${f.copies}</td>
         <td>${f.tracked ? '<span class="tag committed">committed</span>' : ""}
             ${!f.removable ? '<span class="tag">history</span>' : ""}</td>
         <td><select class="act" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}>${opts}</select></td>
-        <td>${r ? `<span class="tag ${r.ok ? "ok" : "fail"}">${r.detail}</span>` : ""}</td>
+        <td>${r ? `<span class="tag ${r.ok ? "ok" : "fail"}">${esc(r.detail)}</span>` : ""}</td>
       </tr>`;
     })
     .join("");
