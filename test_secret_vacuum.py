@@ -298,13 +298,16 @@ def test_generated_trees_are_not_reported(tmp_path: Path):
 # --------------------------------------------------------------- guarantee 3: server is locked down
 
 
-def request(url: str, headers: dict | None = None, method: str = "GET") -> tuple[int, str]:
-    req = urllib.request.Request(url, headers=headers or {}, method=method)
+def send(req: urllib.request.Request) -> tuple[int, str]:
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
+
+
+def request(url: str, headers: dict | None = None, method: str = "GET") -> tuple[int, str]:
+    return send(urllib.request.Request(url, headers=headers or {}, method=method))
 
 
 def test_server_rejects_everything_without_the_right_token_host_and_origin(tmp_path: Path):
@@ -348,22 +351,14 @@ def test_malformed_and_oversized_requests_are_refused_not_crashed(tmp_path: Path
     base, token = url.split("/?t=")
 
     req = urllib.request.Request(base + f"/api/apply?t={token}", data=b"not json", method="POST")
-    assert request_raw(req)[0] == 400
+    assert send(req)[0] == 400
 
     req = urllib.request.Request(base + f"/api/apply?t={token}", data=b'"a string"', method="POST")
-    assert request_raw(req)[0] == 400
+    assert send(req)[0] == 400
 
     req = urllib.request.Request(base + f"/api/apply?t={token}", method="POST",
                                  data=b"{}", headers={"Content-Length": "2000000"})
-    assert request_raw(req)[0] == 413
-
-
-def request_raw(req) -> tuple[int, str]:
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, r.read().decode()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
+    assert send(req)[0] == 413
 
 
 def test_scan_json_output_is_grouped_and_carries_no_values(tmp_path: Path):
