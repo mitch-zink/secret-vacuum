@@ -60,25 +60,13 @@ paths = [
   # local application databases and their write-ahead logs: page contents and
   # content hashes, not credentials anyone can act on
   '''\.(db|db-wal|db-shm|sqlite|sqlite3)$''',
+  # OS and virtualisation caches, reached once the default scope became $HOME
+  '''(^|/)Library/(Caches|Containers|Group Containers)/''',
+  '''(^|/)Library/Developer/(CoreSimulator|Xcode/DerivedData)/''',
+  '''(^|/)AppData/Local/(Temp|Packages)/''',
+  '''(^|/)\.cache/''',
+  '''(^|/)(\.Trash|\.local/share/Trash)/''',
+  '''(?i)(^|/)\$RECYCLE\.BIN/''',
+  '''(^|/)(OrbStack|\.orbstack|\.vagrant\.d|VirtualBox VMs)/''',
+  '''\.(iso|dmg|vmdk|qcow2|img)$''',
 ]
-
-[[allowlists]]
-description = "Documentation placeholders, not credentials"
-regexes = [
-  # YOUR_TOKEN, your-api-key, <your token here>, MY_SECRET
-  '''(?i)^(bearer\s+)?[<{\[]?(your|my)[-_ ]''',
-  '''(?i)^[<{].+[>}]$''',
-  # the usual fill-me-in words
-  '''(?i)(changeme|change[-_]me|replace[-_]?me|insert[-_]?your|placeholder|redacted|^dummy|^sample[-_]|^example[-_]|^test[-_]token|^fake[-_])''',
-  # an environment variable reference is a pointer to a secret, not one
-  '''^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$''',
-  # keyboard-mash and canonical dummy values
-  '''(?i)^(0?123456789|1234567890|abcdef|deadbeef|0123456789abcdef|1234567890abcdef)''',
-  # RE2 has no backreferences, so repeated-character fillers are spelled out
-  '''(?i)^(x{6,}|a{6,}|z{6,}|0{6,}|1{6,}|\.{6,}|-{6,})$''',
-]
-
-[[allowlists]]
-description = "S3 presigned URLs carry a key id by design and expose no secret"
-regexTarget = "line"
-regexes = ['''X-Amz-Credential=''', '''X-Amz-Signature=''']

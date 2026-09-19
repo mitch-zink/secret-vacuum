@@ -55,6 +55,7 @@
   .tag.committed{background:var(--hazard-bg);color:var(--hazard)}
   .tag.ok{background:var(--safe-bg);color:var(--safe)}
   .tag.fail{background:var(--danger-bg);color:var(--danger)}
+  code{font:12px var(--mono);background:var(--sunk);padding:1px 4px;border-radius:3px}
   .note:not(:empty){font:12px var(--sans);color:var(--soft);margin:0 0 8px}
   select{font:12px var(--sans);padding:4px 6px;border:1px solid var(--rule);border-radius:3px;
     background:var(--surface);color:var(--ink)}
@@ -150,7 +151,20 @@ function render() {
        A root that failed is not a root that is clean.<div class="locs">${
          state.failures.map(esc).join("<br>")}</div></div>`
     : "";
-  $("banner").innerHTML = failed + (committed
+  // Every filtered finding, named and revealable. A scan that suppressed
+  // everything used to look exactly like a scan that found nothing.
+  const sup = state.suppressed || [];
+  const supN = sup.reduce((t, r) => t + r.count, 0);
+  const filtered = supN
+    ? `<div class="note"><b>${supN} finding${supN === 1 ? "" : "s"} suppressed by ${
+         sup.length} rule${sup.length === 1 ? "" : "s"}.</b>
+       <details><summary class="more">show what was filtered</summary>
+       <div class="locs">${sup.map((r) =>
+         `<b>${esc(r.rule)}</b> &times;${r.count} &mdash; ${esc(r.reason)}<br>${
+           r.paths.map(esc).join("<br>")}`).join("<br><br>")}</div></details>
+       Re-run with <code>--no-filter</code> to scan without them.</div>`
+    : "";
+  $("banner").innerHTML = failed + filtered + (committed
     ? `<div class="note"><b>${committed} of these appear in a committed file.</b> Removing the file here does
        not unleak the value. It is in every clone and in the history. Rotate those credentials.
        They are still removable; you just need to know that removing is not enough.</div>`

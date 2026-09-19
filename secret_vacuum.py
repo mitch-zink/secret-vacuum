@@ -26,12 +26,13 @@ import subprocess
 import sys
 import threading
 import webbrowser
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path, PurePath
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 HOME = Path.home()
 STATE = Path(os.environ.get("SECRET_VACUUM_HOME", HOME / ".secret-vacuum"))
@@ -42,42 +43,133 @@ CONFIG_FILE = Path(__file__).with_name("gitleaks.toml")
 PLACEHOLDER = "<removed by secret-vacuum>"
 DOT = "\u2022"
 
-# Credential stores worth scanning by default. Personal directories
-# (~/Documents, ~/Downloads, ~/Desktop) are deliberately absent: heavy noise,
-# and no engineer's credentials belong there. Add them with --root.
-DEFAULT_ROOTS = [
-    "~/Documents/GitHub",
-    "~/.aws",
-    "~/.ssh",
-    "~/.dbt",
-    "~/.config/gcloud",
-    "~/.docker/config.json",
-    "~/.kube",
-    "~/.netrc",
-    "~/.npmrc",
-    "~/.pypirc",
-    # Every shell startup file, not just .zshrc: an exported token lives in
-    # whichever one set it, and the live environment has no file to remove.
-    "~/.zshrc",
-    "~/.zshenv",
-    "~/.zprofile",
-    "~/.zlogin",
-    "~/.bashrc",
-    "~/.bash_profile",
-    "~/.bash_login",
-    "~/.profile",
-    "~/.config/fish/config.fish",
-    "~/.zsh_history",
-    "~/.bash_history",
-    "~/.claude.json",
-    "~/.cursor",
+# Credential stores an infostealer walks, per platform. Used by --quick; the
+# default scope is the whole home directory minus DENY, because an allow-list is
+# wrong again the next time a vendor invents a dotfile.
+QUICK_ROOTS = [
+    ".aws", ".azure", ".config/gcloud", ".oci", ".kube", ".docker/config.json",
+    ".terraform.d", ".snowflake", ".databrickscfg", ".dbt",
+    ".ssh", ".netrc", "_netrc", ".config/rclone",
+    ".npmrc", ".pypirc", ".config/pip", ".gem/credentials", ".composer/auth.json",
+    ".m2/settings.xml", ".gradle/gradle.properties", ".cargo/credentials.toml",
+    ".git-credentials", ".config/git", ".config/gh", ".pgpass", ".my.cnf",
+    # editors and agents: 2026 stealers target these directly
+    ".claude.json", ".claude", ".cursor", ".continue", ".codeium", ".aider.conf.yml",
+    ".config/configstore",
+    # every shell startup file, because an exported token lives in whichever one
+    # set it and the live environment has no file to remove
+    ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc", ".bash_profile",
+    ".bash_login", ".profile", ".config/fish/config.fish",
+    ".zsh_history", ".bash_history", ".zsh_sessions",
+    "Documents/WindowsPowerShell", "Documents/PowerShell",
+    "AppData/Roaming/gcloud", "AppData/Roaming/pip",
+    "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine",
 ]
+
+# Trees no credential of yours is authored in. Skipped for speed. This is the only
+# kind of skipping done silently; anything that drops an actual finding is a
+# SUPPRESSOR, which is counted and shown.
+DENY = [
+    "Library/Caches", "Library/Containers", "Library/Group Containers",
+    "Library/Developer/CoreSimulator", "Library/Developer/Xcode/DerivedData",
+    "Library/Application Support/Docker Desktop",
+    "AppData/Local/Temp", "AppData/Local/Packages",
+    ".Trash", ".local/share/Trash", "$RECYCLE.BIN", ".cache",
+    "OrbStack", ".orbstack", ".docker/desktop", ".vagrant.d", "VirtualBox VMs",
+]
+
+
+def quick_roots() -> list[str]:
+    """The curated sweep: seconds rather than minutes."""
+    home = Path.home()
+    return [str(home / r) for r in QUICK_ROOTS if (home / r).exists()]
+
+
+def default_roots() -> list[str]:
+    """Everything you own. The deny-list, not an allow-list, decides what is out."""
+    return [str(Path.home())]
+
 
 # Rewriting shell history is its own kind of damage, so history files are
 # shown and redactable but never removable as a whole file.
-REDACT_ONLY = ("/.zsh_history", "/.bash_history")
+def base_name(path: str) -> str:
+    """Final component, splitting on both separators. PurePath would use only the
+    host's separator, so a Windows path inspected on POSIX is one long filename and
+    every name-based guard below silently stops matching."""
+    return re.split(r"[\\/]", str(path))[-1]
+
+
+# Matched on the file name: the old suffix test looked for "/.bash_history",
+# which no Windows path contains, so the guard quietly did nothing there.
+REDACT_ONLY = frozenset({
+    ".zsh_history", ".bash_history", ".sh_history", ".history",
+    ".python_history", ".node_repl_history", ".psql_history", ".mysql_history",
+    "ConsoleHost_history.txt",
+})
 
 ACTIONS = ("remove", "redact", "ignore")
+
+
+@dataclass(frozen=True)
+class Suppressor:
+    """A filter that drops a real finding.
+
+    These used to live in gitleaks.toml, where the effect was invisible: a scan
+    that filtered everything and a scan that found nothing both printed nothing.
+    One of them matched the *line* and so suppressed an AKIA access key id
+    embedded in a presigned S3 URL, and there was no way to see that had
+    happened. Now every drop is counted, attributed to a named rule, and can be
+    revealed or switched off.
+
+    `generic_only` is the structural half of that fix: a filter that reasons
+    about surrounding context may never overrule a typed, high-confidence rule."""
+
+    name: str
+    reason: str
+    pattern: re.Pattern
+    target: str = "secret"  # "secret" or "match" (the surrounding text gitleaks matched)
+    generic_only: bool = False
+
+    def hides(self, f: Finding) -> bool:
+        if self.generic_only and "generic" not in f.rule:
+            return False
+        return bool(self.pattern.search(f.secret if self.target == "secret" else f.match))
+
+
+SUPPRESSORS = [
+    Suppressor("placeholder", "documentation placeholder, not a value", re.compile(
+        r"""(?ix) ^(bearer\s+)? [<{\[]? (your|my)[-_ ] | ^[<{].+[>}]$
+            | (changeme|change[-_]me|replace[-_]?me|insert[-_]?your|placeholder
+               |redacted|^dummy|^sample[-_]|^example[-_]|^test[-_]token|^fake[-_])""")),
+    Suppressor("env-reference", "a pointer to a secret, not one",
+               re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")),
+    Suppressor("filler", "keyboard-mash or one character repeated", re.compile(
+        r"(?i)^(0?123456789|1234567890|abcdef|deadbeef|0123456789abcdef|1234567890abcdef)"
+        # Python has backreferences, unlike the RE2 engine gitleaks uses, so this
+        # is one pattern instead of the six spelled-out ones it replaces.
+        r"|^(.)\2{5,}$")),
+    Suppressor("aws-example-key", "the key id from AWS' own documentation",
+               re.compile(r"^AKIAIOSFODNN7EXAMPLE$")),
+    # Scoped to generic rules and to the surrounding text. An S3 presigned URL is a
+    # time-limited signature, but it carries a real AKIA id, and the typed
+    # aws-access-token hit for that id must survive this filter.
+    Suppressor("presigned-url", "an expiring S3 signature, not a stored credential",
+               re.compile(r"X-Amz-(Signature|Credential)="), target="match",
+               generic_only=True),
+]
+
+
+def partition(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
+    """Kept, and dropped-with-a-reason. Nothing leaves without being counted."""
+    kept, dropped = [], []
+    for f in findings:
+        hit = next((s for s in SUPPRESSORS if s.hides(f)), None)
+        if hit:
+            f.suppressed_by, f.suppressed_why = hit.name, hit.reason
+            dropped.append(f)
+        else:
+            kept.append(f)
+    return kept, dropped
 
 # The server is threaded, so two clicks can land at once. apply_actions and undo
 # both take this for their whole body, so the guarantee holds for any caller and
@@ -97,13 +189,18 @@ def _binary(name: str) -> str:
     scan-failure handlers already cover it."""
     found = shutil.which(name)
     if not found:
-        raise FileNotFoundError(f"{name} not found on PATH. Install it first: brew install {name}")
+        how = {"darwin": f"brew install {name}",
+               "win32": f"winget install {name}"}.get(sys.platform, f"your package manager: {name}")
+        raise FileNotFoundError(f"{name} not found on PATH. Install it first: {how}")
     return found
 
 # Files that exist only to hold credentials: removing the whole thing is right.
 # Anything else is a file you still want, so the default is to redact the line.
+# Matched against the name alone, so a backslash-separated path works too.
 CREDENTIAL_FILES = re.compile(
-    r"(^|/)(\.env[^/]*|\.netrc|\.npmrc|\.pypirc|credentials|id_[a-z0-9]+|[^/]+\.(pem|key|p12|pfx|jks))$"
+    r"^(\.env.*|\.netrc|_netrc|\.npmrc|\.pypirc|credentials|credentials\.tfrc\.json"
+    r"|auth\.json|\.pgpass|id_[a-z0-9]+|.+\.(pem|key|p12|pfx|jks|ovpn|keystore))$",
+    re.IGNORECASE,
 )
 
 
@@ -123,7 +220,10 @@ class Finding:
     end_line: int
     entropy: float
     secret: str = field(repr=False)
+    match: str = field(default="", repr=False)
     tracked: bool = False
+    suppressed_by: str = ""
+    suppressed_why: str = ""
 
     @property
     def digest(self) -> str:
@@ -141,11 +241,11 @@ class Finding:
     def suggested(self) -> str:
         """Pre-selected action. Never destructive by surprise: whole-file removal is
         only the default for files that are nothing but credential."""
-        return "remove" if self.removable and CREDENTIAL_FILES.search(self.path) else "redact"
+        return "remove" if self.removable and CREDENTIAL_FILES.match(base_name(self.path)) else "redact"
 
     @property
     def removable(self) -> bool:
-        return not self.path.endswith(REDACT_ONLY)
+        return base_name(self.path) not in REDACT_ONLY
 
     def public(self) -> dict:
         return {
@@ -303,7 +403,8 @@ def scan_root(root: Path) -> list[dict]:
 
 
 def scan(roots: list[str], progress: bool = False,
-         failures: list[str] | None = None) -> list[Finding]:
+         failures: list[str] | None = None,
+         suppressed: list[Finding] | None = None) -> list[Finding]:
     """A first run over a developer's whole code directory takes minutes, so say
     what is happening rather than looking hung."""
     wanted = [Path(r).expanduser() for r in roots]
@@ -316,7 +417,8 @@ def scan(roots: list[str], progress: bool = False,
     # The caller owns this list, so two concurrent scans cannot overwrite each
     # other's failures the way a module global did.
     failures = [] if failures is None else failures
-    del failures[:]
+    suppressed = [] if suppressed is None else suppressed
+    del failures[:], suppressed[:]
     raw: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(scan_root, p): p for p in paths}
@@ -357,12 +459,19 @@ def scan(roots: list[str], progress: bool = False,
             end_line=h["EndLine"],
             entropy=h.get("Entropy", 0.0),
             secret=h["Secret"],
+            match=h.get("Match", ""),
         )
         found.setdefault(f.fingerprint, f)
 
-    for f in found.values():
+    kept, dropped = partition(list(found.values()))
+    suppressed.extend(dropped)
+    if progress and dropped:
+        by_rule = Counter(f.suppressed_by for f in dropped)
+        print(f"  {len(dropped)} finding(s) suppressed: "
+              + ", ".join(f"{n} {k}" for k, n in by_rule.most_common()), flush=True)
+    for f in kept:
         f.tracked = git_tracked(f.path)
-    return sorted(found.values(), key=lambda f: (not f.tracked, f.path, f.start_line))
+    return sorted(kept, key=lambda f: (not f.tracked, f.path, f.start_line))
 
 
 # --------------------------------------------------------------------------- actions
@@ -377,9 +486,40 @@ def _batch_dir() -> Path:
     return d
 
 
+def trash_rel(path: str | PurePath, flavour: type[PurePath] | None = None) -> PurePath:
+    """An absolute path encoded as a relative one, for storing inside a batch.
+
+    The root has to become an ordinary component. Joining a rooted path discards
+    everything to its left, so `batch / "files" / "C:/Users/x/.env"` is just
+    `C:/Users/x/.env` -- the computed trash destination was the original file,
+    and the move was a no-op that got recorded as a success. The same is true of
+    a UNC share, so the whole anchor is percent-encoded into one component rather
+    than guessed at: it is ugly in the tree and exactly reversible, which is the
+    right trade on a path that has to put your file back.
+
+    POSIX keeps the layout it always had, so batches from earlier versions still
+    restore. `flavour` exists so the Windows behaviour is testable from a POSIX
+    machine, which is the only way this stays correct between Windows CI runs."""
+    cls = flavour or PurePath
+    q = cls(path)
+    rest = str(q)[len(q.anchor):]
+    if q.anchor in ("", "/"):
+        return cls(rest)
+    return cls(quote(q.anchor, safe=""), rest)
+
+
+def trash_abs(rel: PurePath, windows: bool | None = None) -> Path:
+    """Inverse of trash_rel, on the platform that wrote the batch."""
+    windows = (os.name == "nt") if windows is None else windows
+    parts = tuple(rel.parts)
+    if windows and parts:
+        return Path(unquote(parts[0]), *parts[1:])
+    return Path("/", *parts)
+
+
 def _stash(batch: Path, src: Path) -> Path:
     """Copy a file into the batch preserving its absolute path, so undo is a reversal."""
-    dest = batch / "files" / str(src).lstrip("/")
+    dest = batch / "files" / trash_rel(src)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     return dest
@@ -490,7 +630,7 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
             elif not Path(f.path).exists():
                 results.append({"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"})
             else:
-                dest = batch / "files" / f.path.lstrip("/")
+                dest = batch / "files" / trash_rel(f.path)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(f.path, dest)  # move, never unlink
                 moved.add(f.path)
@@ -575,7 +715,7 @@ def undo(batch: Path | None = None) -> dict:
         for src in sorted(files.rglob("*")):
             if not src.is_file():
                 continue
-            dest = Path("/") / src.relative_to(files)
+            dest = trash_abs(src.relative_to(files))
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), dest)
@@ -657,9 +797,10 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/rescan":
             git_tracked.cache_clear()  # a file may have been committed since the last scan
             failures: list[str] = []
+            dropped: list[Finding] = []
             try:
-                found = scan(self.state["roots"], failures=failures)
-                published = _scan_state(found, failures)
+                found = scan(self.state["roots"], failures=failures, suppressed=dropped)
+                published = _scan_state(found, failures, dropped)
             except (RuntimeError, OSError) as e:
                 # scan raises when no root could be read at all, and grouping
                 # shells out to git. Answer with the reason rather than dropping
@@ -705,10 +846,12 @@ class Handler(BaseHTTPRequestHandler):
             "gitleaks": self.state["gitleaks"],
             "batches": [b.name for b in batches()],
             "failures": list(scanned["failures"]),
+            "suppressed": scanned["suppressed"],
         }
 
 
-def _scan_state(findings: list[Finding], failures: list[str] | None) -> dict:
+def _scan_state(findings: list[Finding], failures: list[str] | None,
+                suppressed: list[Finding] | None = None) -> dict:
     """Everything a rescan replaces, in one object. Assigning groups, failures and
     the timestamp separately lets a reader pair one scan's findings with another
     scan's failure list, and a run whose roots could not be read would then show
@@ -717,14 +860,16 @@ def _scan_state(findings: list[Finding], failures: list[str] | None) -> dict:
     return {
         "groups": {g.key: g for g in group_findings(findings)},
         "failures": list(failures or []),
+        "suppressed": suppression_summary(suppressed or []),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
 
 def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
-          open_browser: bool = True, failures: list[str] | None = None) -> str:
+          open_browser: bool = True, failures: list[str] | None = None,
+          suppressed: list[Finding] | None = None) -> str:
     Handler.state = {
-        "scan": _scan_state(findings, failures),
+        "scan": _scan_state(findings, failures, suppressed),
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
@@ -746,10 +891,24 @@ def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
 # --------------------------------------------------------------------------- cli
 
 
-def print_table(findings: list[Finding], failures: list[str] | None = None) -> None:
+def suppression_summary(suppressed: list[Finding]) -> list[dict]:
+    """What was filtered, by rule. The UI renders this and can reveal it; the point
+    is that a scan which filtered everything never again looks like a clean one."""
+    by_rule: dict[str, list[Finding]] = {}
+    for f in suppressed:
+        by_rule.setdefault(f.suppressed_by, []).append(f)
+    return sorted(
+        ({"rule": k, "reason": v[0].suppressed_why, "count": len(v),
+          "paths": sorted({display_path(m.path) for m in v})[:50]} for k, v in by_rule.items()),
+        key=lambda r: -r["count"])
+
+
+def print_table(findings: list[Finding], failures: list[str] | None = None,
+                suppressed: list[Finding] | None = None) -> None:
     groups = group_findings(findings)
     if not groups:
         print("No secrets found.")
+        _print_suppressed(suppressed)
         return
     print(f"{'VALUE':<18}  {'RULE':<24}  {'COPIES':>6}  {'FLAGS':<10}  FIRST SEEN")
     for g in groups:
@@ -761,6 +920,14 @@ def print_table(findings: list[Finding], failures: list[str] | None = None) -> N
     tracked = sum(g.tracked for g in groups)
     print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
           f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
+    _print_suppressed(suppressed)
+
+
+def _print_suppressed(suppressed: list[Finding] | None) -> None:
+    for row in suppression_summary(suppressed or []):
+        print(f"  suppressed {row['count']:>4}  {row['rule']:<16} {row['reason']}")
+    if suppressed:
+        print("  re-run with --no-filter to see them.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -771,6 +938,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--apply", action="store_true", help="allow changes; without it the UI is read only")
     ap.add_argument("--json", action="store_true", help="with scan: emit findings as JSON (masked, never values)")
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    ap.add_argument("--quick", action="store_true",
+                    help="scan the known credential stores only, not the whole home directory")
+    ap.add_argument("--no-filter", action="store_true",
+                    help="report every finding, including the ones the suppressors would drop")
     a = ap.parse_args(argv)
 
     if a.command == "undo":
@@ -778,13 +949,18 @@ def main(argv: list[str] | None = None) -> int:
         print(r["detail"])
         return 0 if r["ok"] else 1
 
-    roots = a.root or DEFAULT_ROOTS
+    if a.no_filter:
+        SUPPRESSORS.clear()
+    roots = a.root or (quick_roots() if a.quick else default_roots())
     failures: list[str] = []
+    dropped: list[Finding] = []
     try:
         if not (a.command == "scan" and a.json):
-            print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
+            scope = "quick" if a.quick else ("custom" if a.root else "home")
+            print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  "
+                  f"{scope} scope, {len(roots)} root(s)...")
         findings = scan(roots, progress=not (a.command == "scan" and a.json),
-                        failures=failures)
+                        failures=failures, suppressed=dropped)
     except (RuntimeError, OSError) as e:
         # Every root failed, or the scanner is not installed at all. Say why,
         # rather than printing a traceback.
@@ -792,12 +968,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.command == "scan":
         if a.json:
-            print(json.dumps([g.public() for g in group_findings(findings)], indent=1))
+            print(json.dumps({"findings": [g.public() for g in group_findings(findings)],
+                              "suppressed": suppression_summary(dropped)}, indent=1))
         else:
-            print_table(findings, failures)
+            print_table(findings, failures, dropped)
         return 0
 
-    serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures)
+    serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures,
+          suppressed=dropped)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

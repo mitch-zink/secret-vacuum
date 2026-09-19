@@ -582,15 +582,17 @@ def test_every_location_is_reported_not_a_sample(tmp_path: Path):
 def test_all_shell_startup_files_are_scanned(tmp_path: Path):
     """An exported token lives in whichever startup file set it. Only ~/.zshrc was
     covered, so a token exported from ~/.zprofile was invisible."""
-    roots = set(sv.DEFAULT_ROOTS)
-    for rc in ("~/.zshrc", "~/.zshenv", "~/.zprofile", "~/.zlogin", "~/.bashrc",
-               "~/.bash_profile", "~/.bash_login", "~/.profile",
-               "~/.config/fish/config.fish"):
+    roots = set(sv.QUICK_ROOTS)
+    for rc in (".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc",
+               ".bash_profile", ".bash_login", ".profile",
+               ".config/fish/config.fish",
+               "Documents/PowerShell", "Documents/WindowsPowerShell"):
         assert rc in roots, f"{rc} is a place an export can hide"
-    for hist in ("~/.zsh_history", "~/.bash_history"):
-        assert hist in roots
-        assert not sv.Finding("f", str(Path.home() / hist[2:]), "r", "d", 1, 1, 0.0,
+    for hist in (".zsh_history", ".bash_history", "ConsoleHost_history.txt"):
+        assert not sv.Finding("f", str(Path.home() / hist), "r", "d", 1, 1, 0.0,
                               FAKE_STRIPE).removable, "history stays redact-only"
+    # and the default scope is the whole home directory, not an allow-list
+    assert sv.default_roots() == [str(Path.home())]
 
 
 # --------------------------------------------------------------- guarantee 3: server is locked down
@@ -672,10 +674,12 @@ def test_scan_json_output_is_grouped_and_carries_no_values(tmp_path: Path):
         sv.main(["scan", "--json", "--root", str(tmp_path)])
     payload = out.getvalue()
 
-    groups = json.loads(payload)
+    doc = json.loads(payload)
+    groups = doc["findings"]
     assert len(groups) == 1 and groups[0]["copies"] == 2
     assert FAKE_STRIPE not in payload
     assert "key" in groups[0] and "paths" in groups[0]
+    assert "suppressed" in doc, "the machine surface must report what was filtered too"
 
 
 def test_a_non_ascii_token_is_refused_not_a_crash(tmp_path: Path):
@@ -1117,6 +1121,122 @@ def test_a_rescan_never_tears_a_snapshot(tmp_path: Path):
         stop[0] = True
         writer.join()
     assert not torn, torn[:3]
+
+
+# ----------------------------------------------------- portability of the delete path
+
+
+def test_a_trash_destination_never_escapes_its_batch(tmp_path: Path):
+    """The old encoding stripped a leading slash, which does nothing to a Windows
+    path. Joining a rooted path discards everything left of it, so the computed
+    trash destination WAS the original file and the move was a no-op recorded as a
+    success. Checked for every root shape, from a POSIX machine, because a Windows
+    runner is not in the loop on every commit."""
+    from pathlib import PurePosixPath, PureWindowsPath
+    cases = [
+        (PureWindowsPath, r"C:\Users\dev\project\.env"),
+        (PureWindowsPath, r"D:\x\y.pem"),
+        (PureWindowsPath, r"\\server\share\dev\.env"),
+        (PurePosixPath, "/home/dev/project/.env"),
+        (PurePosixPath, "/Users/dev/.aws/credentials"),
+    ]
+    for flavour, raw in cases:
+        rel = sv.trash_rel(raw, flavour=flavour)
+        assert not rel.is_absolute(), f"{raw} escaped the batch as {rel}"
+        assert ".." not in rel.parts, f"{raw} could climb out of the batch"
+        back = sv.trash_abs(rel, windows=flavour is PureWindowsPath)
+        assert flavour(str(back)) == flavour(raw), f"{raw} restored to {back}"
+
+
+def test_posix_trash_layout_is_unchanged(tmp_path: Path):
+    """Batches written by earlier versions still restore, so the encoding change
+    cannot strand a file someone already moved to the trash."""
+    from pathlib import PurePosixPath
+    assert sv.trash_rel("/home/dev/x.env", flavour=PurePosixPath) == PurePosixPath("home/dev/x.env")
+
+
+def test_history_files_are_redact_only_on_every_platform(tmp_path: Path):
+    """The guard used to test for "/.bash_history" as a suffix, which no Windows
+    path contains, so on Windows the whole-file delete was offered for a shell
+    history. PowerShell history was never covered at all."""
+    for raw in (r"C:\Users\dev\.bash_history", "/home/dev/.bash_history",
+                r"C:\Users\d\AppData\Roaming\Microsoft\Windows\PowerShell"
+                r"\PSReadLine\ConsoleHost_history.txt"):
+        f = finding(raw, FAKE_STRIPE)
+        assert not f.removable, f"{raw} must never be removable as a whole file"
+        assert f.suggested == "redact"
+
+
+def test_credential_files_are_recognised_with_either_separator(tmp_path: Path):
+    for raw in (r"C:\Users\dev\project\.env", "/home/dev/project/.env",
+                r"C:\Users\dev\.aws\credentials", r"C:\certs\server.pem"):
+        assert finding(raw, FAKE_STRIPE).suggested == "remove", raw
+
+
+def test_no_authors_home_directory_is_baked_into_the_tool(tmp_path: Path):
+    """~/Documents/GitHub was hardcoded in the defaults: my folder, shipped in a
+    public tool, so everyone else got a root that does not exist while their own
+    code was never scanned."""
+    src = Path(sv.__file__).read_text()
+    assert str(Path.home()) not in src, "this machine's home directory is in the source"
+    assert "Documents/GitHub" not in src, "one person's code folder is not a default"
+    # Every curated root is relative to whatever home the tool runs as.
+    for r in sv.QUICK_ROOTS:
+        assert not r.startswith(("/", "~", "\\")) and ":" not in r, f"{r} is not portable"
+    assert sv.default_roots() == [str(Path.home())]
+
+
+# ----------------------------------------------------- suppression is visible
+
+
+def test_a_context_filter_never_overrules_a_typed_rule(tmp_path: Path):
+    """The bug this whole layer exists for. An S3 presigned URL is an expiring
+    signature, so a filter suppressed it -- but the URL carries a real AKIA key id,
+    and the typed aws-access-token hit for that id was suppressed along with it.
+    The scan then reported the file clean."""
+    url = "https://b.s3.amazonaws.com/k?X-Amz-Credential=" + FAKE_AWS_ID + "/20260101/us-east-1"
+    akia = finding("/x/terraform.tfstate", FAKE_AWS_ID)
+    akia.rule, akia.match = "aws-access-token", url
+    signature = finding("/x/terraform.tfstate", "9f2c1a" * 10)
+    signature.rule, signature.match = "generic-api-key", "X-Amz-Signature=" + "9f2c1a" * 10
+
+    kept, dropped = sv.partition([akia, signature])
+    assert [f.rule for f in kept] == ["aws-access-token"], "the key id must survive"
+    assert [f.suppressed_by for f in dropped] == ["presigned-url"]
+
+
+def test_every_drop_is_counted_and_attributed(tmp_path: Path):
+    """A scan that filtered everything and a scan that found nothing used to print
+    exactly the same thing."""
+    noise = [finding("/x/.env", v) for v in ("YOUR_TOKEN_HERE", "${SOME_VAR}", "xxxxxxxxxx")]
+    real = finding("/x/.env", FAKE_STRIPE)
+    kept, dropped = sv.partition(noise + [real])
+    assert len(kept) == 1 and len(dropped) == 3
+    rows = sv.suppression_summary(dropped)
+    assert sum(r["count"] for r in rows) == 3
+    assert all(r["reason"] and r["rule"] for r in rows), "a drop without a reason is invisible again"
+
+
+def test_no_filter_reports_what_the_suppressors_would_drop(tmp_path: Path):
+    sandbox(tmp_path)
+    (tmp_path / ".env").write_text(f"K={FAKE_STRIPE}\n")
+    kept, _ = sv.partition([finding("/x/.env", "YOUR_TOKEN_HERE")])
+    assert not kept, "suppressed by default"
+    saved = list(sv.SUPPRESSORS)
+    sv.SUPPRESSORS.clear()
+    try:
+        kept, dropped = sv.partition([finding("/x/.env", "YOUR_TOKEN_HERE")])
+        assert len(kept) == 1 and not dropped, "--no-filter must report everything"
+    finally:
+        sv.SUPPRESSORS[:] = saved
+
+
+def test_the_ui_payload_carries_the_suppression_summary(tmp_path: Path):
+    sandbox(tmp_path)
+    dropped = [finding("/x/.env", "YOUR_TOKEN_HERE")]
+    sv.partition(dropped)
+    state = sv._scan_state([finding(str(tmp_path / "a.env"), FAKE_STRIPE)], [], dropped)
+    assert state["suppressed"] and state["suppressed"][0]["count"] == 1
 
 
 # --------------------------------------------------------------- runner
