@@ -55,6 +55,7 @@
   .tag.committed{background:var(--hazard-bg);color:var(--hazard)}
   .tag.ok{background:var(--safe-bg);color:var(--safe)}
   .tag.fail{background:var(--danger-bg);color:var(--danger)}
+  .note:not(:empty){font:12px var(--sans);color:var(--soft);margin:0 0 8px}
   select{font:12px var(--sans);padding:4px 6px;border:1px solid var(--rule);border-radius:3px;
     background:var(--surface);color:var(--ink)}
   .note{background:var(--hazard-bg);color:var(--hazard);border-left:3px solid var(--hazard);
@@ -77,6 +78,12 @@
   <label><input type="checkbox" id="onlyCommitted"> committed only</label>
   <button id="all">Select all</button>
   <button id="none">Clear</button>
+  <label>set to <select id="bulk">
+    <option value="">suggested</option>
+    <option value="remove">remove</option>
+    <option value="redact">redact</option>
+    <option value="ignore">ignore</option>
+  </select></label>
   <div class="grow"></div>
   <button id="rescan">Rescan</button>
   <button id="undo">Undo last</button>
@@ -85,6 +92,7 @@
 
 <div class="wrap">
   <div id="banner"></div>
+  <div id="note" class="note"></div>
   <div class="tbl-scroll">
   <table id="tbl" hidden>
     <thead><tr>
@@ -191,11 +199,14 @@ function render() {
 
 const picked = () => [...document.querySelectorAll(".pick:checked")].map((c) => c.dataset.fp);
 
-function syncApply() {
+function syncApply(skipped) {
   const n = picked().length;
   $("apply").disabled = n === 0 || !state.apply;
   $("apply").textContent = state.apply ? (n ? `Apply to ${n} selected` : "Apply") : "Preview mode";
   $("apply").title = state.apply ? "" : "Restart with --apply to make changes";
+  $("note").textContent = skipped
+    ? `${skipped} row(s) kept their own action: history files are redacted, never deleted.`
+    : "";
 }
 
 async function load(path, body) {
@@ -215,6 +226,21 @@ $("rows").addEventListener("change", syncApply);
 $("filter").addEventListener("input", render);
 $("onlyCommitted").addEventListener("change", render);
 $("all").onclick = () => { document.querySelectorAll(".pick:not(:disabled)").forEach((c) => (c.checked = true)); syncApply(); };
+// Set every selected row at once. A row that cannot take the action keeps its own:
+// "remove" on a shell history would delete the file to get at one line of it.
+$("bulk").onchange = (e) => {
+  const want = e.target.value;
+  if (!want) return;
+  let skipped = 0;
+  for (const fp of picked()) {
+    const sel = document.querySelector(`.act[data-fp="${fp}"]`);
+    const opt = [...sel.options].find((o) => o.value === want);
+    if (opt && !opt.disabled) sel.value = want;
+    else skipped++;
+  }
+  e.target.value = "";
+  syncApply(skipped);
+};
 $("none").onclick = () => { document.querySelectorAll(".pick").forEach((c) => (c.checked = false)); syncApply(); };
 $("rescan").onclick = () => { results = {}; load("/api/rescan", {}); };
 $("undo").onclick = () => load("/api/undo", {});
@@ -223,10 +249,25 @@ $("apply").onclick = () => {
     key: fp,
     action: document.querySelector(`.act[data-fp="${fp}"]`).value,
   }));
-  const copies = acts.reduce(
-    (t, a) => t + (state.findings.find((f) => f.key === a.key)?.copies || 0), 0);
-  if (!confirm(`Apply to ${acts.length} secret(s) across ${copies} file location(s)?\n\n` +
-               `Undo restores everything from this batch.`)) return;
+  const at = (key) => state.findings.find((f) => f.key === key);
+  const copies = acts.reduce((t, a) => t + (at(a.key)?.copies || 0), 0);
+  // Remove takes the whole file, so name the files rather than only counting
+  // secrets. Deleting a dotfile to get at one line of it is the mistake this
+  // dialog exists to catch.
+  const doomed = [...new Set(acts.filter((a) => a.action === "remove")
+    .flatMap((a) => (at(a.key)?.paths || []).map((p) => p.replace(/:\d+$/, ""))))].sort();
+  const edits = acts.filter((a) => a.action === "redact").length;
+  const skips = acts.filter((a) => a.action === "ignore").length;
+  const lines = [`Apply to ${acts.length} secret(s) across ${copies} file location(s).`, ""];
+  if (doomed.length) {
+    lines.push(`${doomed.length} whole file(s) move to the trash:`);
+    lines.push(...doomed.slice(0, 15).map((p) => `    ${p}`));
+    if (doomed.length > 15) lines.push(`    and ${doomed.length - 15} more`);
+  }
+  if (edits) lines.push(`${edits} value(s) replaced in place, the file stays.`);
+  if (skips) lines.push(`${skips} ignored from now on, nothing on disk changes.`);
+  lines.push("", "Undo restores everything from this batch.");
+  if (!confirm(lines.join("\n"))) return;
   load("/api/apply", { actions: acts });
 };
 
