@@ -56,6 +56,8 @@
   .tag.ok{background:var(--safe-bg);color:var(--safe)}
   .tag.fail{background:var(--danger-bg);color:var(--danger)}
   code{font:12px var(--mono);background:var(--sunk);padding:1px 4px;border-radius:3px}
+  .tag.live{background:var(--danger-bg);color:var(--danger)}
+  .tag.dead{background:var(--sunk);color:var(--faint)}
   .tag.rotate{background:var(--hazard-bg);color:var(--hazard)}
   .tag.schema{background:var(--safe-bg);color:var(--safe)}
   .note:not(:empty){font:12px var(--sans);color:var(--soft);margin:0 0 8px}
@@ -204,7 +206,12 @@ function render() {
         <td>${f.tracked ? '<span class="tag committed">committed</span>' : ""}
             ${f.editable === false ? '<span class="tag rotate">rotate only</span>'
               : !f.removable ? '<span class="tag">history</span>' : ""}
-            ${f.detector === "schema" ? '<span class="tag schema">parsed</span>' : ""}</td>
+            ${f.detector === "schema" ? '<span class="tag schema">parsed</span>' : ""}
+            ${f.live === "live" ? `<span class="tag live" title="${esc(f.live_detail)}">live</span>`
+              : f.live === "revoked" ? `<span class="tag dead" title="${esc(f.live_detail)}">revoked</span>`
+              : f.state === "expired" ? `<span class="tag dead" title="${esc(f.state_detail)}">expired</span>`
+              : f.state === "live-shape" ? `<span class="tag" title="${esc(f.state_detail)}">valid shape</span>`
+              : ""}</td>
         <td><select class="act" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}>${opts}</select></td>
         <td>${r ? `<span class="tag ${r.ok ? "ok" : "fail"}">${esc(r.detail)}</span>` : ""}</td>
       </tr>`;

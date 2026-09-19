@@ -238,6 +238,8 @@ class Finding:
     # read a field that is a credential by definition). Different trust, so the
     # UI ranks on it and can hide one.
     detector: str = "pattern"
+    # Set only by an explicit --verify live run; ("", "") otherwise.
+    live: tuple[str, str] = ("", "")
     tracked: bool = False
     suppressed_by: str = ""
     suppressed_why: str = ""
@@ -271,6 +273,11 @@ class Finding:
         """False where any edit is worse than the leak it removes."""
         return not ROTATE_ONLY.search(base_name(self.path))
 
+    @property
+    def state(self) -> tuple[str, str]:
+        """What can be known about this value without asking anyone."""
+        return offline_check(self.secret)
+
     def public(self) -> dict:
         return {
             "fingerprint": self.fingerprint,
@@ -289,6 +296,10 @@ class Finding:
             "editable": self.editable,
             "suggested": self.suggested,
             "detector": self.detector,
+            "state": self.state[0],
+            "state_detail": self.state[1],
+            "live": self.live[0],
+            "live_detail": self.live[1],
         }
 
 
@@ -341,6 +352,10 @@ class Group:
             "editable": self.editable,
             "suggested": self.suggested,
             "detector": "schema" if any(m.detector == "schema" for m in self.members) else "pattern",
+            "state": self.lead.state[0],
+            "state_detail": self.lead.state[1],
+            "live": self.lead.live[0],
+            "live_detail": self.lead.live[1],
         }
 
 
@@ -349,7 +364,11 @@ def group_findings(findings: list[Finding]) -> list[Group]:
     for f in findings:
         by_value.setdefault(f.digest, []).append(f)
     groups = [Group(k, sorted(v, key=lambda m: m.path)) for k, v in by_value.items()]
-    return sorted(groups, key=lambda g: (not g.tracked, -len(g.members), g.lead.path))
+    # Exploitability, not presence: proven live first, then committed, then shape.
+    rank = {"live": 0, "": 1, "skipped": 1, "unknown": 1, "revoked": 3}
+    return sorted(groups, key=lambda g: (rank.get(g.lead.live[0], 2), not g.tracked,
+                                         g.lead.state[0] == "expired",
+                                         -len(g.members), g.lead.path))
 
 
 def mask(value: str) -> str:
@@ -776,6 +795,54 @@ SKIP_DIRS = frozenset({
 })
 
 
+# --------------------------------------------------------------------------- offline checks
+#
+# "You have 92 secrets" is a list. "7 of these still parse as live credentials and
+# 3 expired in March" is a queue. Everything here reaches that second sentence
+# without a single packet: a JWT carries its own expiry, a private key either
+# parses or does not, an AWS key id has a fixed shape. Live verification -- asking
+# the provider -- lives in verify.py, which this module never imports, so the
+# scanner, the server and the UI keep their no-network guarantee structurally
+# rather than by policy.
+
+JWT_RE = re.compile(r"^[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*$")
+AWS_ID_RE = re.compile(r"^(AKIA|ASIA|AIDA|AROA|AGPA|ANPA|ANVA|APKA)[A-Z2-7]{16}$")
+
+
+def _b64pad(chunk: str) -> bytes:
+    return base64.urlsafe_b64decode(chunk + "=" * (-len(chunk) % 4))
+
+
+def offline_check(value: str) -> tuple[str, str]:
+    """(state, detail) with no network. States: live-shape, expired, malformed, unknown.
+
+    "live-shape" never means the credential works -- only that nothing locally
+    checkable rules it out. Nothing here is evidence of safety."""
+    v = value.strip()
+    if JWT_RE.match(v):
+        try:
+            claims = json.loads(_b64pad(v.split(".")[1]))
+        except Exception:  # noqa: BLE001
+            return "malformed", "looks like a JWT but the payload does not decode"
+        exp = claims.get("exp")
+        if isinstance(exp, (int, float)):
+            left = exp - datetime.now(timezone.utc).timestamp()
+            when = datetime.fromtimestamp(exp, timezone.utc).date().isoformat()
+            return ("expired", f"JWT expired {when}") if left <= 0 else \
+                   ("live-shape", f"JWT valid until {when}")
+        return "live-shape", "JWT with no expiry claim"
+    if AWS_ID_RE.match(v):
+        return "live-shape", "well-formed AWS key id"
+    if "BEGIN" in v and "PRIVATE KEY" in v:
+        body = "".join(ln for ln in v.splitlines() if "-----" not in ln)
+        try:
+            _b64pad(body.replace("/", "_").replace("+", "-"))
+        except Exception:  # noqa: BLE001
+            return "malformed", "PEM header present but the body does not decode"
+        return "live-shape", "private key, parses"
+    return "unknown", ""
+
+
 # --------------------------------------------------------------------------- actions
 
 
@@ -1068,6 +1135,123 @@ def undo(batch: Path | None = None) -> dict:
         return {"ok": True, "detail": f"restored {restored} file(s) from {batch.name}"}
 
 
+# --------------------------------------------------------------------------- report-only
+#
+# Three places a credential can sit where deletion is not the answer. An exported
+# variable has no file to remove; a container's environment belongs to the
+# container; the OS keystore is where secrets are *supposed* to live. Reporting
+# them is still worth doing, because "it is not in a file" is exactly why people
+# forget they are there.
+
+CRED_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API[-_]?KEY|_KEY$"
+                       r"|PRIVATE|SESSION|COOKIE|BEARER|_PAT$|SIGNING)", re.IGNORECASE)
+# Canonical UUID only. Matching any long hex string would drop real tokens, which
+# are frequently 32 hex characters.
+UUIDISH = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def env_report(environ: dict | None = None, roots: list[str] | None = None) -> list[dict]:
+    """Credential-shaped variables, each traced back to the file that set it.
+
+    Three outcomes, and the middle one is the reason this exists: a value with no
+    file behind it cannot be fixed by anything else this tool does."""
+    environ = os.environ if environ is None else environ
+    sources = [Path(r) for r in (roots or quick_roots())]
+    files = [p for p in sources if p.is_file()]
+    out = []
+    for name, value in sorted(environ.items()):
+        # The name is the actionable signal. A high-entropy value under a name
+        # that claims nothing is as likely to be a socket path or an instance id,
+        # and this report exists to be acted on rather than skimmed past.
+        if (not _secret_shaped(value) or len(value) < 16 or UUIDISH.match(value)
+                or PUBLIC_NAME.search(name) or not CRED_NAME.search(name)):
+            continue
+        holders = []
+        for f in files:
+            try:
+                if value in f.read_text(errors="replace"):
+                    holders.append(display_path(str(f)))
+            except OSError:
+                continue
+        out.append({
+            "name": name, "length": len(value), "sha8": hashlib.sha256(value.encode()).hexdigest()[:8],
+            "sources": holders,
+            "advice": (f"remove it from {holders[0]}, then `unset {name}` in shells already running"
+                       if holders else
+                       f"no file on this machine sets this; `unset {name}` clears it here only"),
+        })
+    return out
+
+
+def docker_report() -> list[dict]:
+    """Variable names and image per running container. Never a value: the point is
+    to remind you the container has them, not to copy them out."""
+    try:
+        ids = subprocess.run([_binary("docker"), "ps", "-q"], capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if ids.returncode != 0 or not ids.stdout.strip():
+        return []
+    out = []
+    for cid in ids.stdout.split():
+        try:
+            r = subprocess.run([_binary("docker"), "inspect", cid], capture_output=True,
+                               text=True, timeout=10)
+            spec = json.loads(r.stdout)[0]
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError, KeyError):
+            continue
+        names = [e.split("=", 1)[0] for e in (spec.get("Config", {}).get("Env") or [])
+                 if CRED_NAME.search(e.split("=", 1)[0])]
+        if names:
+            out.append({"container": spec.get("Name", cid).lstrip("/"),
+                        "image": spec.get("Config", {}).get("Image", "?"), "names": sorted(names)})
+    return out
+
+
+def keystore_report() -> list[dict]:
+    """Item and service names only. Nothing here reads a value, and there is no
+    delete action: the keystore is the right place for a secret to be."""
+    if sys.platform == "darwin":
+        cmd, pat = ["security", "dump-keychain"], re.compile(r'"svce"<blob>="([^"]*)"')
+    elif os.name == "nt":
+        cmd, pat = ["cmdkey", "/list"], re.compile(r"Target:\s*(\S+)")
+    else:
+        return []
+    try:
+        # No -d: attributes only, so this never asks for a value and never prompts.
+        r = subprocess.run([_binary(cmd[0]), *cmd[1:]], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    counts = Counter(m for m in pat.findall(r.stdout) if m)
+    return [{"service": k, "items": n} for k, n in counts.most_common(40)]
+
+
+def print_report(env_rows: list[dict], docker_rows: list[dict], keys: list[dict]) -> None:
+    traced = [r for r in env_rows if r["sources"]]
+    orphan = [r for r in env_rows if not r["sources"]]
+    print(f"\n{len(env_rows)} credential-shaped environment variable(s).")
+    for label, rows in (("set by a file you can fix", traced), ("no file sets these", orphan)):
+        if not rows:
+            continue
+        print(f"\n  {label}:")
+        for r in rows:
+            where = ", ".join(r["sources"]) if r["sources"] else "-"
+            print(f"    {r['name']:<34} {r['sha8']}  {where}")
+            print(f"        {r['advice']}")
+    print("\n  Redacting the file does not change a shell that is already running.")
+    if docker_rows:
+        print(f"\n{len(docker_rows)} running container(s) hold credential-shaped variables:")
+        for d in docker_rows:
+            print(f"    {d['container']:<28} {d['image'][:38]:<40} {', '.join(d['names'])[:60]}")
+    if keys:
+        print(f"\n{sum(k['items'] for k in keys)} keystore item(s) across {len(keys)} service(s). "
+              "This is where secrets belong; nothing to remove.")
+        for k in keys[:12]:
+            print(f"    {k['service'][:52]:<54} {k['items']}")
+
+
 # --------------------------------------------------------------------------- server
 
 
@@ -1241,6 +1425,31 @@ def suppression_summary(suppressed: list[Finding]) -> list[dict]:
         key=lambda r: -r["count"])
 
 
+def run_live_verification(findings: list[Finding]) -> list[Finding]:
+    """Opt-in, and loud about it. verify.py is imported here and nowhere else, so
+    the scanner and server have no network capability to misuse."""
+    import verify  # noqa: PLC0415 - deliberately not a module-level import
+
+    rules = sorted({f.rule for f in findings if verify.verifiable(f.rule)})
+    if not rules:
+        print("  nothing here has a verifier; leaving them as offline checks only")
+        return findings
+    print(f"  asking {', '.join(verify.destinations(rules))} whether these still work.")
+    print("  this is a real request with your credential and lands in their audit log.")
+    canaries = verify.load_registry(STATE / "canaries.txt")
+    done: dict[str, tuple[str, str]] = {}
+    for f in findings:
+        if not verify.verifiable(f.rule):
+            continue
+        if verify.is_canary(f.secret, f.path, canaries):
+            f.live = ("skipped", "looks like a honeytoken; verifying one is the alarm")
+            continue
+        if f.digest not in done:  # one request per distinct value, never per copy
+            done[f.digest] = verify.verify(f.rule, f.secret)
+        f.live = done[f.digest]
+    return findings
+
+
 def print_table(findings: list[Finding], failures: list[str] | None = None,
                 suppressed: list[Finding] | None = None) -> None:
     groups = group_findings(findings)
@@ -1270,7 +1479,8 @@ def _print_suppressed(suppressed: list[Finding] | None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="secret-vacuum", description=__doc__.splitlines()[0])
-    ap.add_argument("command", nargs="?", default="ui", choices=("ui", "scan", "undo"))
+    ap.add_argument("command", nargs="?", default="ui",
+                    choices=("ui", "scan", "undo", "env"))
     ap.add_argument("--root", action="append", default=[], metavar="PATH",
                     help="scan this path instead of the defaults (repeatable)")
     ap.add_argument("--apply", action="store_true", help="allow changes; without it the UI is read only")
@@ -1278,9 +1488,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
     ap.add_argument("--quick", action="store_true",
                     help="scan the known credential stores only, not the whole home directory")
+    ap.add_argument("--verify", choices=("never", "offline", "live"), default="offline",
+                    help="offline (default) checks shape and expiry with no network; "
+                         "live also asks each provider, which writes to their audit log")
+    ap.add_argument("--docker", action="store_true",
+                    help="with env: also list credential-shaped variables in running containers")
+    ap.add_argument("--keychain", action="store_true",
+                    help="with env: also inventory the OS keystore (names only, never values)")
     ap.add_argument("--no-filter", action="store_true",
                     help="report every finding, including the ones the suppressors would drop")
     a = ap.parse_args(argv)
+
+    if a.command == "env":
+        print_report(env_report(roots=a.root or None),
+                     docker_report() if a.docker else [],
+                     keystore_report() if a.keychain else [])
+        return 0
 
     if a.command == "undo":
         r = undo()
@@ -1303,6 +1526,9 @@ def main(argv: list[str] | None = None) -> int:
         # Every root failed, or the scanner is not installed at all. Say why,
         # rather than printing a traceback.
         return print(f"scan failed: {e}", file=sys.stderr) or 2
+
+    if a.verify == "live":
+        findings = run_live_verification(findings)
 
     if a.command == "scan":
         if a.json:

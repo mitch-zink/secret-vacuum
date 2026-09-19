@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import urllib.error
 import urllib.request
@@ -940,11 +941,97 @@ def test_the_apply_endpoint_answers_400_on_a_malformed_payload(tmp_path: Path):
 # --------------------------------------------------------------- guarantee 4: no network
 
 
-def test_the_tool_has_no_outbound_network_capability():
+def test_the_scanner_has_no_outbound_network_capability():
+    """Still structural, not a flag. The scanner, the local server and the UI
+    cannot make a request even if something asked them to: live verification lives
+    in verify.py, which secret_vacuum.py imports only inside the one function that
+    --verify live reaches."""
     source = Path(sv.__file__).read_text()
     for banned in ("import requests", "import urllib.request", "from urllib.request",
                    "import http.client", "import socket", "urlopen("):
         assert banned not in source, f"secret_vacuum.py must not reference {banned}"
+    assert source.count("import verify") == 1, "verify must not become a module-level import"
+    assert "    import verify" in source, "and it must stay inside the function"
+
+
+def test_a_verifier_may_only_talk_to_the_issuer_of_the_credential():
+    """A verifier that can be pointed anywhere is an exfiltration primitive."""
+    import verify
+    for rule, (host, url, _headers) in verify.VERIFIERS.items():
+        assert url.startswith(f"https://{host}/"), f"{rule} targets {url}, not {host}"
+    assert verify.destinations(["github-pat", "stripe-access-token", "nonexistent"]) == [
+        "api.github.com", "api.stripe.com"]
+
+
+def test_verification_is_off_unless_asked_for(tmp_path: Path):
+    sandbox(tmp_path)
+    (tmp_path / "a.env").write_text(f"K={FAKE_STRIPE}\n")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        sv.main(["scan", "--json", "--root", str(tmp_path)])
+    doc = json.loads(out.getvalue())
+    assert doc["findings"][0]["live"] == "", "a default scan must never have asked anyone"
+
+
+def test_a_throttled_check_is_unknown_not_revoked():
+    """429 says the provider would not answer, not that the key is dead. Reporting
+    it as revoked tells someone a live credential is safe to leave alone."""
+    import verify
+
+    class Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def throttled(_req, timeout=0):
+        raise urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
+
+    def rejected(_req, timeout=0):
+        raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+
+    def offline(_req, timeout=0):
+        raise OSError("network is unreachable")
+
+    assert verify.verify("github-pat", "x", opener=throttled)[0] == "unknown"
+    assert verify.verify("github-pat", "x", opener=rejected)[0] == "revoked"
+    assert verify.verify("github-pat", "x", opener=offline)[0] == "unknown"
+    assert verify.verify("github-pat", "x", opener=lambda *a, **k: Resp())[0] == "live"
+    assert verify.verify("no-such-rule", "x", opener=offline)[0] == "unknown"
+
+
+def test_a_honeytoken_is_never_verified():
+    """A canary exists so that any use raises an alarm. Verifying one IS the alarm,
+    and the alarm would say this machine is compromised."""
+    import verify
+    # A canary is built to be indistinguishable from a real credential, so the
+    # value is not the signal. The path is, and so is a registry the owner keeps.
+    assert verify.is_canary("x", "/x/from-canarytokens.org/creds")
+    assert verify.is_canary("x", "/home/d/.aws/honeytoken-profile")
+    assert not verify.is_canary(FAKE_STRIPE, "/x/.env"), "an unknown value is treated as real"
+    reg = {verify._sha8(FAKE_STRIPE)}
+    assert verify.is_canary(FAKE_STRIPE, "/x/.env", reg), "the owner can mark one"
+
+
+def test_offline_checks_separate_expired_from_plausible():
+    import base64 as b64
+    enc = lambda d: b64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    jwt = lambda exp: f"{enc({'alg': 'HS256'})}.{enc({'sub': 'a', 'exp': exp})}.c2ln"
+    now = int(time.time())
+    assert sv.offline_check(jwt(now - 86400))[0] == "expired"
+    assert sv.offline_check(jwt(now + 86400))[0] == "live-shape"
+    assert sv.offline_check(FAKE_AWS_ID)[0] == "live-shape"
+    assert sv.offline_check("just some high entropy text here")[0] == "unknown"
+    assert sv.offline_check("aaaa.bbbb.cccc")[0] == "malformed"
+
+
+def test_a_live_credential_sorts_above_a_merely_present_one(tmp_path: Path):
+    """The point of verification is triage order, not a badge."""
+    dead = finding("/x/a.env", "sk_" + "live_dead000000000000000")
+    alive = finding("/x/b.env", "sk_" + "live_alive00000000000000")
+    alive.live = ("live", "accepted")
+    dead.live = ("revoked", "rejected")
+    order = [g.lead.live[0] for g in sv.group_findings([dead, alive])]
+    assert order == ["live", "revoked"], order
 
 
 # --------------------------------------------------------------- end to end, real gitleaks
@@ -1357,6 +1444,69 @@ def test_a_parser_that_raises_never_loses_the_scan(tmp_path: Path):
     good = tmp_path / ".env"
     good.write_text(f"TOKEN={FAKE_STRIPE}\n")
     assert sv.parse_file(good), "the next file still parses"
+
+
+# ----------------------------------------------------- what cannot be deleted
+
+
+def test_an_environment_variable_is_traced_back_to_the_file_that_set_it(tmp_path: Path):
+    """An exported variable has no file to delete, so the actionable thing is the
+    file that exported it. The variable with no file behind it is the whole reason
+    this report exists."""
+    rc = tmp_path / ".zshrc"
+    secret = "sbp_" + "0123456789abcdef0123456789abcdef"
+    rc.write_text(f"export SUPABASE_ACCESS_TOKEN={secret}\n")
+    rows = sv.env_report(
+        environ={"SUPABASE_ACCESS_TOKEN": secret,
+                 "ORPHAN_API_KEY": "qQ7wE2rT5yU8iO1pA4sD6fG9hJ0kL3zX",  # gitleaks:allow
+                 "HOME": "/home/dev", "SSH_AUTH_SOCK": "/private/tmp/agent.sock",
+                 "BUILD_ID": "9f1c2e3a-4b5d-6e7f-8a9b-0c1d2e3f4a5b"},
+        roots=[str(rc)])
+    by_name = {r["name"]: r for r in rows}
+    assert set(by_name) == {"SUPABASE_ACCESS_TOKEN", "ORPHAN_API_KEY"}, sorted(by_name)
+    assert by_name["SUPABASE_ACCESS_TOKEN"]["sources"] == [sv.display_path(str(rc))]
+    assert not by_name["ORPHAN_API_KEY"]["sources"]
+    assert "unset ORPHAN_API_KEY" in by_name["ORPHAN_API_KEY"]["advice"]
+    assert all(secret not in json.dumps(r) for r in rows), "the report never carries a value"
+
+
+def test_the_report_only_surfaces_never_print_a_value(tmp_path: Path):
+    """These three exist to tell you something is there. None of them may copy it
+    out: that is exactly what the malware this defends against does."""
+    secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        sv.print_report(
+            sv.env_report(environ={"GH_TOKEN": secret}, roots=[]),
+            [{"container": "api", "image": "app:1", "names": ["DB_PASSWORD"]}],
+            [{"service": "com.example.thing", "items": 3}])
+    body = out.getvalue()
+    assert secret not in body
+    assert "DB_PASSWORD" in body and "com.example.thing" in body
+    assert "nothing to remove" in body, "the keystore is where a secret belongs"
+
+
+def test_docker_and_keystore_absence_is_a_skip_not_a_failure(tmp_path: Path):
+    """No daemon, or a platform with no supported keystore, must be silence."""
+    real = sv.shutil.which
+    sv.shutil.which = lambda n: None if n in ("docker", "security", "cmdkey") else real(n)
+    try:
+        assert sv.docker_report() == []
+        assert sv.keystore_report() == []
+    finally:
+        sv.shutil.which = real
+
+
+def test_the_keystore_is_never_asked_for_a_value():
+    """security dump-keychain with -d prints the secrets themselves and prompts per
+    item. Nothing here may ever reach for that."""
+    src = Path(sv.__file__).read_text()
+    assert "dump-keychain" in src, "the inventory should still exist"
+    # -d turns an attribute listing into a dump of the secrets themselves, and
+    # prompts for every item.
+    after = src.split("dump-keychain", 1)[1][:60]
+    assert '"-d"' not in after and "'-d'" not in after
+    assert "find-generic-password" not in src, "that reads a value back"
 
 
 # --------------------------------------------------------------- runner
