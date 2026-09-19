@@ -44,7 +44,16 @@ jobs:
           echo "$env:RUNNER_TEMP\\gl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - run: gitleaks version
       - run: pip install --quiet pytest
-      - run: python -m pytest test_secret_vacuum.py -q
+      # The runner's %TEMP% lives under AppData\Local\Temp, which the scanner
+      # deliberately skips, so fixtures written there would be invisible to the
+      # thing under test. Put them somewhere a real scan would look.
+      - shell: pwsh
+        run: |
+          "TMP=$env:RUNNER_TEMP\svt"       | Out-File $env:GITHUB_ENV -Append
+          "TEMP=$env:RUNNER_TEMP\svt"      | Out-File $env:GITHUB_ENV -Append
+          "TMPDIR=$env:RUNNER_TEMP\svt"    | Out-File $env:GITHUB_ENV -Append
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\svt" | Out-Null
+      - run: python -m pytest test_secret_vacuum.py -q --basetemp=${{ runner.temp }}/svt/pt
       - run: python test_secret_vacuum.py
 
   sast:

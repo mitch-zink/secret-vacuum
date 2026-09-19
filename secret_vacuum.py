@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 HOME = Path.home()
@@ -899,13 +899,22 @@ def trash_rel(path: str | PurePath, flavour: type[PurePath] | None = None) -> Pu
     return cls(quote(q.anchor, safe=""), rest)
 
 
-def trash_abs(rel: PurePath, windows: bool | None = None) -> Path:
-    """Inverse of trash_rel, on the platform that wrote the batch."""
-    windows = (os.name == "nt") if windows is None else windows
+def trash_abs_pure(rel: PurePath, windows: bool) -> PurePath:
+    """Inverse of trash_rel, as pure path arithmetic.
+
+    Split out from trash_abs so both platforms' behaviour can be asserted from
+    either platform: pathlib.Path is whatever the host is, so a POSIX round trip
+    checked on Windows silently compares backslashes to slashes and passes or
+    fails for the wrong reason."""
     parts = tuple(rel.parts)
     if windows and parts:
-        return Path(unquote(parts[0]), *parts[1:])
-    return Path("/", *parts)
+        return PureWindowsPath(unquote(parts[0]), *parts[1:])
+    return PurePosixPath("/", *parts)
+
+
+def trash_abs(rel: PurePath) -> Path:
+    """The same thing as a real path on the platform that wrote the batch."""
+    return Path(trash_abs_pure(rel, os.name == "nt"))
 
 
 def _stash(batch: Path, src: Path) -> Path:
@@ -917,8 +926,16 @@ def _stash(batch: Path, src: Path) -> Path:
 
 
 def _parse_error(path: Path) -> str:
-    """Empty string when the file still parses as whatever its extension claims."""
-    parser = STRUCTURED.get(PurePath(base_name(str(path))).suffix.lower())
+    """Empty string when the file still parses as whatever its name claims.
+
+    Matched on the whole name rather than PurePath.suffix: a file called `.json`
+    has no suffix at all, and `terraform.tfstate.backup` has `.backup`, so a
+    suffix lookup silently skips the check on exactly the files most worth
+    checking."""
+    name = base_name(str(path)).lower()
+    parser = next((fn for ext, fn in STRUCTURED.items()
+                   if name == ext.lstrip(".") or name.endswith(ext)
+                   or f"{ext}." in name), None)
     if not parser:
         return ""
     try:
@@ -1010,6 +1027,7 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
             continue
         lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
         changed = False
+        mark = len(entries)
         for f in sorted(group, key=lambda f: -f.start_line):
             lines, ok = redact_lines(lines, f)
             results.append({
@@ -1034,6 +1052,11 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
                 shutil.copy2(stashed, src)
                 for r in results[-len(group):]:
                     r["ok"], r["detail"] = False, f"left alone: editing it broke the file ({broke})"
+                # The rollback un-did every edit to this file, so the manifest must
+                # not keep claiming them: undo would otherwise "restore" a file
+                # that was never changed, over whatever is there by then.
+                del entries[mark:]
+                stashed.unlink(missing_ok=True)
 
     moved: set[str] = set()
     for f, a in chosen:

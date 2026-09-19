@@ -1233,8 +1233,8 @@ def test_a_trash_destination_never_escapes_its_batch(tmp_path: Path):
         rel = sv.trash_rel(raw, flavour=flavour)
         assert not rel.is_absolute(), f"{raw} escaped the batch as {rel}"
         assert ".." not in rel.parts, f"{raw} could climb out of the batch"
-        back = sv.trash_abs(rel, windows=flavour is PureWindowsPath)
-        assert flavour(str(back)) == flavour(raw), f"{raw} restored to {back}"
+        back = sv.trash_abs_pure(rel, windows=flavour is PureWindowsPath)
+        assert back == flavour(raw), f"{raw} restored to {back}"
 
 
 def test_posix_trash_layout_is_unchanged(tmp_path: Path):
@@ -1385,6 +1385,24 @@ def test_a_redaction_that_breaks_a_structured_file_is_rolled_back(tmp_path: Path
     assert target.read_text() == original, "the original must come back"
     assert not out["results"][0]["ok"]
     assert "broke the file" in out["results"][0]["detail"], out["results"][0]
+    # A rolled-back edit must leave nothing behind claiming it happened, or undo
+    # will later "restore" a file that was never changed over whatever is there.
+    assert sv.batches() == [], "no batch should survive a fully rolled-back apply"
+    assert sv.undo()["ok"] is False
+
+
+def test_the_parse_check_matches_names_a_suffix_lookup_would_miss(tmp_path: Path):
+    """A file called `.json` has no suffix, and terraform.tfstate.backup has
+    `.backup`, so a suffix lookup skips the check on the files most worth it."""
+    for name in ("app.json", ".json", "terraform.tfstate.backup", "terraform.tfstate"):
+        broken = tmp_path / name
+        broken.write_text("{ not json")
+        assert sv._parse_error(broken), f"{name} should be checked"
+        broken.write_text('{"ok": 1}')
+        assert not sv._parse_error(broken), f"{name} parses now"
+    plain = tmp_path / "notes.txt"
+    plain.write_text("{ not json")
+    assert not sv._parse_error(plain), "an unstructured file has no contract to break"
 
 
 def test_docker_registry_auth_is_decoded(tmp_path: Path):
