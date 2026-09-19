@@ -1512,6 +1512,39 @@ def test_the_keystore_is_never_asked_for_a_value():
     assert "find-generic-password" not in src, "that reads a value back"
 
 
+def test_both_detectors_skip_exactly_the_same_trees(tmp_path: Path):
+    """The parsers keeping their own copy of the skip list is how a downloaded
+    plugin marketplace got parsed but not pattern-scanned, and how 41 findings from
+    somebody else's catalogue reached the table. One list, read from the config
+    gitleaks is handed."""
+    sandbox(tmp_path)
+    vendored = [
+        "node_modules/pkg/.env", ".venv/lib/site-packages/x/.env",
+        ".cursor/extensions/vendor-1.0/.envrc",
+        ".claude/plugins/marketplaces/official/.claude-plugin/catalog.json",
+        ".claude/plugins/cache/thing/1.0/tests/config.json",
+        "dist/bundle.env", ".terraform/modules/m/terraform.tfstate",
+    ]
+    for rel in vendored:
+        f = tmp_path / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"TOKEN={FAKE_STRIPE}\n")
+        assert sv.is_skipped(str(f)), f"{rel} is vendored and must be skipped by the parsers too"
+    mine = tmp_path / "project" / ".env"
+    mine.parent.mkdir(parents=True)
+    mine.write_text(f"TOKEN={FAKE_STRIPE}\n")
+    assert not sv.is_skipped(str(mine))
+
+    # and the walk agrees with the predicate
+    found = {f.path for f in sv.parse_roots([tmp_path])}
+    assert found == {str(mine)}, sorted(found)
+
+
+def test_the_skip_list_covers_windows_separators(tmp_path: Path):
+    assert sv.is_skipped(r"C:\Users\dev\project\node_modules\pkg\.env")
+    assert not sv.is_skipped(r"C:\Users\dev\project\.env")
+
+
 # --------------------------------------------------------------- runner
 
 

@@ -773,28 +773,48 @@ def ignored_fingerprints() -> set[str]:
     return {ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")}
 
 
-def parse_roots(roots: list[Path]) -> list[Finding]:
-    """One metadata walk, pruned by the same deny-list gitleaks uses."""
-    out: list[Finding] = []
-    for root in roots:
-        if root.is_file():
-            out += parse_file(root)
+@functools.lru_cache(maxsize=1)
+def skip_paths() -> list[re.Pattern]:
+    """The path skips, read out of the same gitleaks.toml that gitleaks is given.
+
+    One list, two consumers. Keeping a second copy in Python is how a downloaded
+    plugin marketplace ended up parsed but not pattern-scanned, and how 41
+    findings from somebody else's catalogue reached the table: only one of the two
+    filters knew the tree existed."""
+    try:
+        body = CONFIG_FILE.read_text()
+    except OSError:
+        return []
+    block = body.split("paths = [", 1)[-1].split("\n]", 1)[0] if "paths = [" in body else ""
+    out = []
+    for pat in re.findall(r"'''(.*?)'''", block, re.DOTALL):
+        try:
+            out.append(re.compile(pat))
+        except re.error:
             continue
-        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
-            dirnames[:] = [d for d in dirnames
-                           if not any(f"{dirpath}/{d}".endswith(x) or d == x.split("/")[-1]
-                                      for x in DENY)
-                           and d not in SKIP_DIRS]
-            for fn in filenames:
-                out += parse_file(Path(dirpath) / fn)
     return out
 
 
-SKIP_DIRS = frozenset({
-    "node_modules", ".venv", "venv", "site-packages", "__pycache__", ".git",
-    ".terraform", "dist", "build", "target", ".next", ".cache", "Caches",
-    "vendor", "Pods", "dbt_packages", ".mypy_cache", ".pytest_cache", ".Trash",
-})
+def is_skipped(path: str) -> bool:
+    """Compared with forward slashes so one set of patterns covers both platforms."""
+    return any(rx.search(str(path).replace("\\", "/")) for rx in skip_paths())
+
+
+def parse_roots(roots: list[Path]) -> list[Finding]:
+    """One metadata walk, pruned by exactly the trees gitleaks is told to skip."""
+    out: list[Finding] = []
+    for root in roots:
+        if root.is_file():
+            if not is_skipped(str(root)):
+                out += parse_file(root)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
+            dirnames[:] = [d for d in dirnames if not is_skipped(f"{dirpath}/{d}/")]
+            for fn in filenames:
+                full = Path(dirpath) / fn
+                if not is_skipped(str(full)):
+                    out += parse_file(full)
+    return out
 
 
 # --------------------------------------------------------------------------- offline checks

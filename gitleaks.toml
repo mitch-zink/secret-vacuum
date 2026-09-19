@@ -54,9 +54,14 @@ paths = [
   # editor extensions: thousands of files of somebody else's vendored code,
   # shipped with the editor. Same category as node_modules.
   '''(^|/)\.(cursor|vscode|vscode-insiders|vscode-server|windsurf)/extensions/''',
-  # downloaded plugin and skill content, and scratch dirs holding it
+  # downloaded plugin, skill and marketplace content, and scratch dirs holding it
   '''(^|/)\.tmp/''',
   '''(^|/)bundled_(skills|plugins)/''',
+  # agent plugin caches and marketplace catalogues: third-party content fetched by
+  # the tool, in the same category as node_modules. One catalogue alone accounted
+  # for 41 findings on the machine this was measured against.
+  '''(^|/)\.(claude|cursor|codeium|continue)/plugins/(marketplaces|cache)/''',
+  '''(^|/)\.(claude|cursor)/(ide|statsig|shell-snapshots)/''',
   # local application databases and their write-ahead logs: page contents and
   # content hashes, not credentials anyone can act on
   '''\.(db|db-wal|db-shm|sqlite|sqlite3)$''',
