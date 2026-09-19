@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import urllib.error
 import urllib.request
@@ -80,11 +81,12 @@ def test_public_payload_carries_no_secret_value():
 def test_ignore_store_holds_fingerprints_only(tmp_path: Path):
     sandbox(tmp_path)
     f = finding("/tmp/x/.env", FAKE_STRIPE)
-    sv.add_ignore(f.fingerprint)
-    sv.add_ignore(f.fingerprint)  # idempotent
+    sv.add_ignore(f)
+    sv.add_ignore(f)  # idempotent
     body = sv.IGNORE_FILE.read_text()
-    assert body.strip() == f.fingerprint
-    assert FAKE_STRIPE not in body
+    assert body.split() == [f.fingerprint, f"sv:{f.sha8}"], body
+    assert FAKE_STRIPE not in body, "the store never holds a value"
+    assert f.secret[:8] not in body, "not even a prefix of one"
 
 
 def test_manifest_records_paths_not_values(tmp_path: Path):
@@ -93,9 +95,12 @@ def test_manifest_records_paths_not_values(tmp_path: Path):
     target.write_text(f"token={FAKE_STRIPE}\n")
     f = finding(str(target), FAKE_STRIPE)
     act("remove", f)
-    manifest = next(sv.TRASH.rglob("manifest.json")).read_text()
-    assert FAKE_STRIPE not in manifest
-    assert str(target) in manifest
+    raw = next(sv.TRASH.rglob("manifest.json")).read_text()
+    assert FAKE_STRIPE not in raw
+    # compared as data, not as JSON text: a Windows path is backslash-escaped in
+    # the encoding and would never match the literal
+    entries = json.loads(raw)["entries"]
+    assert [Path(e["path"]) for e in entries] == [target]
 
 
 # --------------------------------------------------------------- guarantee 2: move, never unlink
@@ -112,7 +117,7 @@ def test_remove_moves_to_trash_and_undo_restores_byte_identical(tmp_path: Path):
     out = act("remove", f)
 
     assert out["results"][0]["ok"] and not target.exists()
-    stashed = sv.TRASH / out["batch"] / "files" / str(target).lstrip("/")
+    stashed = sv.TRASH / out["batch"] / "files" / sv.trash_rel(target)
     assert stashed.read_text() == original, "the file must survive intact in the trash"
 
     assert sv.undo()["ok"]
@@ -582,15 +587,17 @@ def test_every_location_is_reported_not_a_sample(tmp_path: Path):
 def test_all_shell_startup_files_are_scanned(tmp_path: Path):
     """An exported token lives in whichever startup file set it. Only ~/.zshrc was
     covered, so a token exported from ~/.zprofile was invisible."""
-    roots = set(sv.DEFAULT_ROOTS)
-    for rc in ("~/.zshrc", "~/.zshenv", "~/.zprofile", "~/.zlogin", "~/.bashrc",
-               "~/.bash_profile", "~/.bash_login", "~/.profile",
-               "~/.config/fish/config.fish"):
+    roots = set(sv.QUICK_ROOTS)
+    for rc in (".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc",
+               ".bash_profile", ".bash_login", ".profile",
+               ".config/fish/config.fish",
+               "Documents/PowerShell", "Documents/WindowsPowerShell"):
         assert rc in roots, f"{rc} is a place an export can hide"
-    for hist in ("~/.zsh_history", "~/.bash_history"):
-        assert hist in roots
-        assert not sv.Finding("f", str(Path.home() / hist[2:]), "r", "d", 1, 1, 0.0,
+    for hist in (".zsh_history", ".bash_history", "ConsoleHost_history.txt"):
+        assert not sv.Finding("f", str(Path.home() / hist), "r", "d", 1, 1, 0.0,
                               FAKE_STRIPE).removable, "history stays redact-only"
+    # and the default scope is the whole home directory, not an allow-list
+    assert sv.default_roots() == [str(Path.home())]
 
 
 # --------------------------------------------------------------- guarantee 3: server is locked down
@@ -672,10 +679,12 @@ def test_scan_json_output_is_grouped_and_carries_no_values(tmp_path: Path):
         sv.main(["scan", "--json", "--root", str(tmp_path)])
     payload = out.getvalue()
 
-    groups = json.loads(payload)
+    doc = json.loads(payload)
+    groups = doc["findings"]
     assert len(groups) == 1 and groups[0]["copies"] == 2
     assert FAKE_STRIPE not in payload
     assert "key" in groups[0] and "paths" in groups[0]
+    assert "suppressed" in doc, "the machine surface must report what was filtered too"
 
 
 def test_a_non_ascii_token_is_refused_not_a_crash(tmp_path: Path):
@@ -935,11 +944,97 @@ def test_the_apply_endpoint_answers_400_on_a_malformed_payload(tmp_path: Path):
 # --------------------------------------------------------------- guarantee 4: no network
 
 
-def test_the_tool_has_no_outbound_network_capability():
+def test_the_scanner_has_no_outbound_network_capability():
+    """Still structural, not a flag. The scanner, the local server and the UI
+    cannot make a request even if something asked them to: live verification lives
+    in verify.py, which secret_vacuum.py imports only inside the one function that
+    --verify live reaches."""
     source = Path(sv.__file__).read_text()
     for banned in ("import requests", "import urllib.request", "from urllib.request",
                    "import http.client", "import socket", "urlopen("):
         assert banned not in source, f"secret_vacuum.py must not reference {banned}"
+    assert source.count("import verify") == 1, "verify must not become a module-level import"
+    assert "    import verify" in source, "and it must stay inside the function"
+
+
+def test_a_verifier_may_only_talk_to_the_issuer_of_the_credential():
+    """A verifier that can be pointed anywhere is an exfiltration primitive."""
+    import verify
+    for rule, (host, url, _headers) in verify.VERIFIERS.items():
+        assert url.startswith(f"https://{host}/"), f"{rule} targets {url}, not {host}"
+    assert verify.destinations(["github-pat", "stripe-access-token", "nonexistent"]) == [
+        "api.github.com", "api.stripe.com"]
+
+
+def test_verification_is_off_unless_asked_for(tmp_path: Path):
+    sandbox(tmp_path)
+    (tmp_path / "a.env").write_text(f"K={FAKE_STRIPE}\n")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        sv.main(["scan", "--json", "--root", str(tmp_path)])
+    doc = json.loads(out.getvalue())
+    assert doc["findings"][0]["live"] == "", "a default scan must never have asked anyone"
+
+
+def test_a_throttled_check_is_unknown_not_revoked():
+    """429 says the provider would not answer, not that the key is dead. Reporting
+    it as revoked tells someone a live credential is safe to leave alone."""
+    import verify
+
+    class Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def throttled(_req, timeout=0):
+        raise urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
+
+    def rejected(_req, timeout=0):
+        raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+
+    def offline(_req, timeout=0):
+        raise OSError("network is unreachable")
+
+    assert verify.verify("github-pat", "x", opener=throttled)[0] == "unknown"
+    assert verify.verify("github-pat", "x", opener=rejected)[0] == "revoked"
+    assert verify.verify("github-pat", "x", opener=offline)[0] == "unknown"
+    assert verify.verify("github-pat", "x", opener=lambda *a, **k: Resp())[0] == "live"
+    assert verify.verify("no-such-rule", "x", opener=offline)[0] == "unknown"
+
+
+def test_a_honeytoken_is_never_verified():
+    """A canary exists so that any use raises an alarm. Verifying one IS the alarm,
+    and the alarm would say this machine is compromised."""
+    import verify
+    # A canary is built to be indistinguishable from a real credential, so the
+    # value is not the signal. The path is, and so is a registry the owner keeps.
+    assert verify.is_canary("x", "/x/from-canarytokens.org/creds")
+    assert verify.is_canary("x", "/home/d/.aws/honeytoken-profile")
+    assert not verify.is_canary(FAKE_STRIPE, "/x/.env"), "an unknown value is treated as real"
+    reg = {verify._sha8(FAKE_STRIPE)}
+    assert verify.is_canary(FAKE_STRIPE, "/x/.env", reg), "the owner can mark one"
+
+
+def test_offline_checks_separate_expired_from_plausible():
+    import base64 as b64
+    enc = lambda d: b64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    jwt = lambda exp: f"{enc({'alg': 'HS256'})}.{enc({'sub': 'a', 'exp': exp})}.c2ln"
+    now = int(time.time())
+    assert sv.offline_check(jwt(now - 86400))[0] == "expired"
+    assert sv.offline_check(jwt(now + 86400))[0] == "live-shape"
+    assert sv.offline_check(FAKE_AWS_ID)[0] == "live-shape"
+    assert sv.offline_check("just some high entropy text here")[0] == "unknown"
+    assert sv.offline_check("aaaa.bbbb.cccc")[0] == "malformed"
+
+
+def test_a_live_credential_sorts_above_a_merely_present_one(tmp_path: Path):
+    """The point of verification is triage order, not a badge."""
+    dead = finding("/x/a.env", "sk_" + "live_dead000000000000000")
+    alive = finding("/x/b.env", "sk_" + "live_alive00000000000000")
+    alive.live = ("live", "accepted")
+    dead.live = ("revoked", "rejected")
+    order = [g.lead.live[0] for g in sv.group_findings([dead, alive])]
+    assert order == ["live", "revoked"], order
 
 
 # --------------------------------------------------------------- end to end, real gitleaks
@@ -971,8 +1066,9 @@ def test_ignoring_a_finding_hides_it_from_the_next_scan(tmp_path: Path):
 
     found = sv.scan([str(root)])
     assert found
-    sv.add_ignore(found[0].fingerprint)
-    assert sv.scan([str(root)]) == [], "gitleaks honours our fingerprint ignore file"
+    sv.add_ignore(found[0])
+    assert sv.scan([str(root)]) == [], ("an ignored value must stay gone: the fingerprint "
+                                        "stops gitleaks, the sv: digest stops our parsers")
 
 
 def test_tracked_files_are_flagged_as_committed(tmp_path: Path):
@@ -1117,6 +1213,375 @@ def test_a_rescan_never_tears_a_snapshot(tmp_path: Path):
         stop[0] = True
         writer.join()
     assert not torn, torn[:3]
+
+
+# ----------------------------------------------------- portability of the delete path
+
+
+def test_a_trash_destination_never_escapes_its_batch(tmp_path: Path):
+    """The old encoding stripped a leading slash, which does nothing to a Windows
+    path. Joining a rooted path discards everything left of it, so the computed
+    trash destination WAS the original file and the move was a no-op recorded as a
+    success. Checked for every root shape, from a POSIX machine, because a Windows
+    runner is not in the loop on every commit."""
+    from pathlib import PurePosixPath, PureWindowsPath
+    cases = [
+        (PureWindowsPath, r"C:\Users\dev\project\.env"),
+        (PureWindowsPath, r"D:\x\y.pem"),
+        (PureWindowsPath, r"\\server\share\dev\.env"),
+        (PurePosixPath, "/home/dev/project/.env"),
+        (PurePosixPath, "/Users/dev/.aws/credentials"),
+    ]
+    for flavour, raw in cases:
+        rel = sv.trash_rel(raw, flavour=flavour)
+        assert not rel.is_absolute(), f"{raw} escaped the batch as {rel}"
+        assert ".." not in rel.parts, f"{raw} could climb out of the batch"
+        back = sv.trash_abs_pure(rel, windows=flavour is PureWindowsPath)
+        assert back == flavour(raw), f"{raw} restored to {back}"
+
+
+def test_posix_trash_layout_is_unchanged(tmp_path: Path):
+    """Batches written by earlier versions still restore, so the encoding change
+    cannot strand a file someone already moved to the trash."""
+    from pathlib import PurePosixPath
+    assert sv.trash_rel("/home/dev/x.env", flavour=PurePosixPath) == PurePosixPath("home/dev/x.env")
+
+
+def test_history_files_are_redact_only_on_every_platform(tmp_path: Path):
+    """The guard used to test for "/.bash_history" as a suffix, which no Windows
+    path contains, so on Windows the whole-file delete was offered for a shell
+    history. PowerShell history was never covered at all."""
+    for raw in (r"C:\Users\dev\.bash_history", "/home/dev/.bash_history",
+                r"C:\Users\d\AppData\Roaming\Microsoft\Windows\PowerShell"
+                r"\PSReadLine\ConsoleHost_history.txt"):
+        f = finding(raw, FAKE_STRIPE)
+        assert not f.removable, f"{raw} must never be removable as a whole file"
+        assert f.suggested == "redact"
+
+
+def test_credential_files_are_recognised_with_either_separator(tmp_path: Path):
+    for raw in (r"C:\Users\dev\project\.env", "/home/dev/project/.env",
+                r"C:\Users\dev\.aws\credentials", r"C:\certs\server.pem"):
+        assert finding(raw, FAKE_STRIPE).suggested == "remove", raw
+
+
+def test_no_authors_home_directory_is_baked_into_the_tool(tmp_path: Path):
+    """~/Documents/GitHub was hardcoded in the defaults: my folder, shipped in a
+    public tool, so everyone else got a root that does not exist while their own
+    code was never scanned."""
+    src = Path(sv.__file__).read_text()
+    assert str(Path.home()) not in src, "this machine's home directory is in the source"
+    assert "Documents/GitHub" not in src, "one person's code folder is not a default"
+    # Every curated root is relative to whatever home the tool runs as.
+    for r in sv.QUICK_ROOTS:
+        assert not r.startswith(("/", "~", "\\")) and ":" not in r, f"{r} is not portable"
+    assert sv.default_roots() == [str(Path.home())]
+
+
+# ----------------------------------------------------- suppression is visible
+
+
+def test_a_context_filter_never_overrules_a_typed_rule(tmp_path: Path):
+    """The bug this whole layer exists for. An S3 presigned URL is an expiring
+    signature, so a filter suppressed it -- but the URL carries a real AKIA key id,
+    and the typed aws-access-token hit for that id was suppressed along with it.
+    The scan then reported the file clean."""
+    url = "https://b.s3.amazonaws.com/k?X-Amz-Credential=" + FAKE_AWS_ID + "/20260101/us-east-1"
+    akia = finding("/x/terraform.tfstate", FAKE_AWS_ID)
+    akia.rule, akia.match = "aws-access-token", url
+    signature = finding("/x/terraform.tfstate", "9f2c1a" * 10)
+    signature.rule = "generic-api-key"
+    signature.match = "X-Amz-" + "Signature=" + "9f2c1a" * 10
+
+    kept, dropped = sv.partition([akia, signature])
+    assert [f.rule for f in kept] == ["aws-access-token"], "the key id must survive"
+    assert [f.suppressed_by for f in dropped] == ["presigned-url"]
+
+
+def test_every_drop_is_counted_and_attributed(tmp_path: Path):
+    """A scan that filtered everything and a scan that found nothing used to print
+    exactly the same thing."""
+    noise = [finding("/x/.env", v) for v in ("YOUR_TOKEN_HERE", "${SOME_VAR}", "xxxxxxxxxx")]
+    real = finding("/x/.env", FAKE_STRIPE)
+    kept, dropped = sv.partition(noise + [real])
+    assert len(kept) == 1 and len(dropped) == 3
+    rows = sv.suppression_summary(dropped)
+    assert sum(r["count"] for r in rows) == 3
+    assert all(r["reason"] and r["rule"] for r in rows), "a drop without a reason is invisible again"
+
+
+def test_no_filter_reports_what_the_suppressors_would_drop(tmp_path: Path):
+    sandbox(tmp_path)
+    (tmp_path / ".env").write_text(f"K={FAKE_STRIPE}\n")
+    kept, _ = sv.partition([finding("/x/.env", "YOUR_TOKEN_HERE")])
+    assert not kept, "suppressed by default"
+    saved = list(sv.SUPPRESSORS)
+    sv.SUPPRESSORS.clear()
+    try:
+        kept, dropped = sv.partition([finding("/x/.env", "YOUR_TOKEN_HERE")])
+        assert len(kept) == 1 and not dropped, "--no-filter must report everything"
+    finally:
+        sv.SUPPRESSORS[:] = saved
+
+
+def test_the_ui_payload_carries_the_suppression_summary(tmp_path: Path):
+    sandbox(tmp_path)
+    dropped = [finding("/x/.env", "YOUR_TOKEN_HERE")]
+    sv.partition(dropped)
+    state = sv._scan_state([finding(str(tmp_path / "a.env"), FAKE_STRIPE)], [], dropped)
+    assert state["suppressed"] and state["suppressed"][0]["count"] == 1
+
+
+# ----------------------------------------------------- schema parsers
+
+
+def test_terraform_state_secrets_are_found_where_patterns_cannot_see_them(tmp_path: Path):
+    """State holds outputs and attributes in plaintext, frequently base64, which
+    defeats entropy scoring. On a real state file gitleaks reported nothing."""
+    tok = "ZXlKaGJHY2lPaUpJVXpJMU5" + "pSjkuZm9vYmFyYmF6cXV4"
+    doc = {"resources": [{"instances": [{"attributes": {
+        "token": tok * 4,
+        "authentication_mode": "API_AND_CONFIG_MAP",
+        "data": {"AB_JWT_SIGNATURE_SECRET": "c2lnbmluZ3Nl" + "Y3JldHZhbHVlaGVyZQ==",
+                 "instance-admin-password": "Y29ycmVjdGhv" + "cnNlYmF0dGVyeQ=="},  # gitleaks:allow
+        "region": "us-east-1", "bucket": "my-state-bucket"}}]}]}
+    f = tmp_path / "terraform.tfstate"
+    f.write_text(json.dumps(doc, indent=1))
+    found = sv.parse_tfstate(f, f.read_text())
+    names = {x.description.split(" in ")[0] for x in found}
+    assert names == {"token", "AB_JWT_SIGNATURE_SECRET", "instance-admin-password"}, names
+    assert "authentication_mode" not in names, "an enum constant is configuration, not a credential"
+
+
+def test_terraform_state_is_reported_but_never_edited(tmp_path: Path):
+    """A line-level replace leaves the JSON parseable and the state no longer
+    describing reality, so the next apply destroys and recreates. Deleting the file
+    is worse. Report it; the only honest action is rotation."""
+    sandbox(tmp_path)
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(json.dumps({"outputs": {"password": {"value": FAKE_STRIPE}}}))
+    f = finding(str(state), FAKE_STRIPE)
+    assert not f.editable and not f.removable
+    assert f.suggested == "ignore"
+    # and the grouped row the UI actually renders, which had its own default
+    g = sv.group_findings([f])[0]
+    assert not g.editable and g.suggested == "ignore", g.public()["suggested"]
+    before = state.read_text()
+    for action in ("remove", "redact"):
+        out = act(action, f)
+        assert not out["results"][0]["ok"]
+        assert "rotate" in out["results"][0]["detail"]
+    assert state.read_text() == before, "state must be untouched by either action"
+
+
+def test_a_redaction_that_breaks_a_structured_file_is_rolled_back(tmp_path: Path):
+    """Redaction is a line-level string replace. Inside a JSON document that can
+    leave something that no longer parses, and a broken kubeconfig is a worse
+    outcome than the redacted line was a good one."""
+    sandbox(tmp_path)
+    target = tmp_path / "app.json"
+    # the value spans the quotes, so replacing it leaves an unterminated string
+    target.write_text('{\n "k": "' + FAKE_STRIPE + '"\n}\n')
+    original = target.read_text()
+    f = finding(str(target), FAKE_STRIPE + '"', line=2)
+    out = act("redact", f)
+    assert target.read_text() == original, "the original must come back"
+    assert not out["results"][0]["ok"]
+    assert "broke the file" in out["results"][0]["detail"], out["results"][0]
+    # A rolled-back edit must leave nothing behind claiming it happened, or undo
+    # will later "restore" a file that was never changed over whatever is there.
+    assert sv.batches() == [], "no batch should survive a fully rolled-back apply"
+    assert sv.undo()["ok"] is False
+
+
+def test_the_parse_check_matches_names_a_suffix_lookup_would_miss(tmp_path: Path):
+    """A file called `.json` has no suffix, and terraform.tfstate.backup has
+    `.backup`, so a suffix lookup skips the check on the files most worth it."""
+    for name in ("app.json", ".json", "terraform.tfstate.backup", "terraform.tfstate"):
+        broken = tmp_path / name
+        broken.write_text("{ not json")
+        assert sv._parse_error(broken), f"{name} should be checked"
+        broken.write_text('{"ok": 1}')
+        assert not sv._parse_error(broken), f"{name} parses now"
+    plain = tmp_path / "notes.txt"
+    plain.write_text("{ not json")
+    assert not sv._parse_error(plain), "an unstructured file has no contract to break"
+
+
+def test_docker_registry_auth_is_decoded(tmp_path: Path):
+    """auths[].auth is base64 of user:password, not encryption. gitleaks sees one
+    opaque blob."""
+    import base64 as b64
+    blob = b64.b64encode(b"AWS:hunter2hunter2hunter2").decode()
+    f = tmp_path / "config.json"
+    f.write_text(json.dumps({"auths": {"registry.example.com": {"auth": blob}}}))
+    found = sv.parse_docker_config(f, f.read_text())
+    assert len(found) == 1
+    assert found[0].secret == "hunter2hunter2hunter2"
+    assert "registry.example.com" in found[0].description
+
+
+def test_kubeconfig_credentials_are_parsed(tmp_path: Path):
+    f = tmp_path / "config"
+    f.write_text(
+        "apiVersion: v1\nusers:\n- name: admin\n  user:\n"
+        "    token: abcdefghijklmnopqrstuvwxyz012345\n"
+        "- name: certuser\n  user:\n    client-key-data: LS0tLS1CRUdJTiBQUklWQVRF\n")
+    found = sv.parse_kubeconfig(f, f.read_text())
+    kinds = {x.description.split(" for ")[0] for x in found}
+    assert kinds == {"token", "client-key-data"}, kinds
+    assert all(x.detector == "schema" for x in found)
+
+
+def test_container_definitions_with_literal_secrets_are_found(tmp_path: Path):
+    d = tmp_path / "Dockerfile"
+    d.write_text("FROM alpine\nENV API_TOKEN=s3cretvalue0123456789\nENV APP_PORT=8080\n")
+    found = sv.parse_container_env(d, d.read_text())
+    assert [x.description.split(" set ")[0] for x in found] == ["API_TOKEN"]
+
+
+def test_credential_file_assignments_beat_the_keyword_list(tmp_path: Path):
+    """gitleaks' generic rule keys off the variable name, so cs= (a client secret)
+    and setup_token= are invisible. In a .env the file name has already said what
+    the values are -- but a key that announces it is public stays out."""
+    f = tmp_path / ".env"
+    f.write_text(
+        "cid=abcdef0123456789abcdef\n"
+        "cs=sUp3rS3cr3t" + "Cl13ntV4lu3\n"
+        "setup_" + "token=pnu_0123456789abcdefghij\n"  # gitleaks:allow
+        "VITE_SUPABASE_URL=https://xyz.supabase.co\n"
+        "VITE_SUPABASE_ANON_" + "KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\n"  # gitleaks:allow
+        "VITE_TURNSTILE_SITE_KEY=0x4AAAAAAADnPIDROlWd9Tm\n"
+        "APP_NAME=my-application-name\n"
+        "# comment=shouldnotmatch0123456\n")
+    names = {x.description.split(" in ")[0] for x in sv.parse_assignments(f, f.read_text())}
+    assert {"cs", "setup_token"} <= names, f"missed a real credential: {names}"
+    assert not names & {"VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY",
+                        "VITE_TURNSTILE_SITE_KEY", "APP_NAME", "comment"}, names
+
+
+def test_a_parser_that_raises_never_loses_the_scan(tmp_path: Path):
+    """A bug in one parser must not cost the findings from every other file."""
+    bad = tmp_path / "terraform.tfstate"
+    bad.write_text("{ this is not json at all")
+    assert sv.parse_file(bad) == []
+    good = tmp_path / ".env"
+    good.write_text(f"TOKEN={FAKE_STRIPE}\n")
+    assert sv.parse_file(good), "the next file still parses"
+
+
+# ----------------------------------------------------- what cannot be deleted
+
+
+def test_an_environment_variable_is_traced_back_to_the_file_that_set_it(tmp_path: Path):
+    """An exported variable has no file to delete, so the actionable thing is the
+    file that exported it. The variable with no file behind it is the whole reason
+    this report exists."""
+    rc = tmp_path / ".zshrc"
+    secret = "sbp_" + "0123456789abcdef0123456789abcdef"
+    rc.write_text(f"export SUPABASE_ACCESS_TOKEN={secret}\n")
+    rows = sv.env_report(
+        environ={"SUPABASE_ACCESS_TOKEN": secret,
+                 "ORPHAN_API_KEY": "qQ7wE2rT5yU8iO1pA4sD6fG9hJ0kL3zX",  # gitleaks:allow
+                 "HOME": "/home/dev", "SSH_AUTH_SOCK": "/private/tmp/agent.sock",
+                 "BUILD_ID": "9f1c2e3a-4b5d-6e7f-8a9b-0c1d2e3f4a5b"},
+        roots=[str(rc)])
+    by_name = {r["name"]: r for r in rows}
+    assert set(by_name) == {"SUPABASE_ACCESS_TOKEN", "ORPHAN_API_KEY"}, sorted(by_name)
+    assert by_name["SUPABASE_ACCESS_TOKEN"]["sources"] == [sv.display_path(str(rc))]
+    assert not by_name["ORPHAN_API_KEY"]["sources"]
+    assert "unset ORPHAN_API_KEY" in by_name["ORPHAN_API_KEY"]["advice"]
+    assert all(secret not in json.dumps(r) for r in rows), "the report never carries a value"
+
+
+def test_the_report_only_surfaces_never_print_a_value(tmp_path: Path):
+    """These three exist to tell you something is there. None of them may copy it
+    out: that is exactly what the malware this defends against does."""
+    secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        sv.print_report(
+            sv.env_report(environ={"GH_TOKEN": secret}, roots=[]),
+            [{"container": "api", "image": "app:1", "names": ["DB_PASSWORD"]}],
+            [{"service": "com.example.thing", "items": 3}])
+    body = out.getvalue()
+    assert secret not in body
+    assert "DB_PASSWORD" in body and "com.example.thing" in body
+    assert "nothing to remove" in body, "the keystore is where a secret belongs"
+
+
+def test_docker_and_keystore_absence_is_a_skip_not_a_failure(tmp_path: Path):
+    """No daemon, or a platform with no supported keystore, must be silence."""
+    real = sv.shutil.which
+    sv.shutil.which = lambda n: None if n in ("docker", "security", "cmdkey") else real(n)
+    try:
+        assert sv.docker_report() == []
+        assert sv.keystore_report() == []
+    finally:
+        sv.shutil.which = real
+
+
+def test_the_keystore_is_never_asked_for_a_value():
+    """security dump-keychain with -d prints the secrets themselves and prompts per
+    item. Nothing here may ever reach for that."""
+    src = Path(sv.__file__).read_text()
+    assert "dump-keychain" in src, "the inventory should still exist"
+    # -d turns an attribute listing into a dump of the secrets themselves, and
+    # prompts for every item.
+    after = src.split("dump-keychain", 1)[1][:60]
+    assert '"-d"' not in after and "'-d'" not in after
+    assert "find-generic-password" not in src, "that reads a value back"
+
+
+def test_both_detectors_skip_exactly_the_same_trees(tmp_path: Path):
+    """The parsers keeping their own copy of the skip list is how a downloaded
+    plugin marketplace got parsed but not pattern-scanned, and how 41 findings from
+    somebody else's catalogue reached the table. One list, read from the config
+    gitleaks is handed."""
+    sandbox(tmp_path)
+    vendored = [
+        "node_modules/pkg/.env", ".venv/lib/site-packages/x/.env",
+        ".cursor/extensions/vendor-1.0/.envrc",
+        ".claude/plugins/marketplaces/official/.claude-plugin/catalog.json",
+        ".claude/plugins/cache/thing/1.0/tests/config.json",
+        "dist/bundle.env", ".terraform/modules/m/terraform.tfstate",
+    ]
+    for rel in vendored:
+        f = tmp_path / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"TOKEN={FAKE_STRIPE}\n")
+        assert sv.is_skipped(str(f)), f"{rel} is vendored and must be skipped by the parsers too"
+    mine = tmp_path / "project" / ".env"
+    mine.parent.mkdir(parents=True)
+    mine.write_text(f"TOKEN={FAKE_STRIPE}\n")
+    assert not sv.is_skipped(str(mine))
+
+    # and the walk agrees with the predicate
+    found = {f.path for f in sv.parse_roots([tmp_path])}
+    assert found == {str(mine)}, sorted(found)
+
+
+def test_the_skip_list_covers_windows_separators(tmp_path: Path):
+    assert sv.is_skipped(r"C:\Users\dev\project\node_modules\pkg\.env")
+    assert not sv.is_skipped(r"C:\Users\dev\project\.env")
+
+
+def test_the_two_detectors_agree_on_what_one_file_is_called(tmp_path: Path):
+    """gitleaks reports forward slashes and os.walk reports the host separator. On
+    Windows the same file therefore arrived under two names, the (path, digest)
+    dedupe never matched, and every finding in a parseable file was counted twice."""
+    sandbox(tmp_path)
+    env = tmp_path / "svc" / ".env"
+    env.parent.mkdir()
+    env.write_text(f"STRIPE_KEY={FAKE_STRIPE}\n")
+
+    found = sv.scan([str(tmp_path)])
+    hits = [f for f in found if f.secret == FAKE_STRIPE]
+    assert len(hits) == 1, [f"{f.detector}:{f.path}" for f in hits]
+    assert sv.group_findings(found)[0].public()["copies"] == 1
+
+    mixed = str(env).replace("\\", "/")
+    assert sv.norm_path(mixed) == sv.norm_path(str(env))
 
 
 # --------------------------------------------------------------- runner

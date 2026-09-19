@@ -14,6 +14,7 @@ Four guarantees, each covered by a test in test_secret_vacuum.py:
 from __future__ import annotations
 
 import argparse
+import base64
 import functools
 import hashlib
 import hmac
@@ -26,12 +27,13 @@ import subprocess
 import sys
 import threading
 import webbrowser
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 HOME = Path.home()
 STATE = Path(os.environ.get("SECRET_VACUUM_HOME", HOME / ".secret-vacuum"))
@@ -42,42 +44,154 @@ CONFIG_FILE = Path(__file__).with_name("gitleaks.toml")
 PLACEHOLDER = "<removed by secret-vacuum>"
 DOT = "\u2022"
 
-# Credential stores worth scanning by default. Personal directories
-# (~/Documents, ~/Downloads, ~/Desktop) are deliberately absent: heavy noise,
-# and no engineer's credentials belong there. Add them with --root.
-DEFAULT_ROOTS = [
-    "~/Documents/GitHub",
-    "~/.aws",
-    "~/.ssh",
-    "~/.dbt",
-    "~/.config/gcloud",
-    "~/.docker/config.json",
-    "~/.kube",
-    "~/.netrc",
-    "~/.npmrc",
-    "~/.pypirc",
-    # Every shell startup file, not just .zshrc: an exported token lives in
-    # whichever one set it, and the live environment has no file to remove.
-    "~/.zshrc",
-    "~/.zshenv",
-    "~/.zprofile",
-    "~/.zlogin",
-    "~/.bashrc",
-    "~/.bash_profile",
-    "~/.bash_login",
-    "~/.profile",
-    "~/.config/fish/config.fish",
-    "~/.zsh_history",
-    "~/.bash_history",
-    "~/.claude.json",
-    "~/.cursor",
+# Credential stores an infostealer walks, per platform. Used by --quick; the
+# default scope is the whole home directory minus DENY, because an allow-list is
+# wrong again the next time a vendor invents a dotfile.
+QUICK_ROOTS = [
+    ".aws", ".azure", ".config/gcloud", ".oci", ".kube", ".docker/config.json",
+    ".terraform.d", ".snowflake", ".databrickscfg", ".dbt",
+    ".ssh", ".netrc", "_netrc", ".config/rclone",
+    ".npmrc", ".pypirc", ".config/pip", ".gem/credentials", ".composer/auth.json",
+    ".m2/settings.xml", ".gradle/gradle.properties", ".cargo/credentials.toml",
+    ".git-credentials", ".config/git", ".config/gh", ".pgpass", ".my.cnf",
+    # editors and agents: 2026 stealers target these directly
+    ".claude.json", ".claude", ".cursor", ".continue", ".codeium", ".aider.conf.yml",
+    ".config/configstore",
+    # every shell startup file, because an exported token lives in whichever one
+    # set it and the live environment has no file to remove
+    ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc", ".bash_profile",
+    ".bash_login", ".profile", ".config/fish/config.fish",
+    ".zsh_history", ".bash_history", ".zsh_sessions",
+    "Documents/WindowsPowerShell", "Documents/PowerShell",
+    "AppData/Roaming/gcloud", "AppData/Roaming/pip",
+    "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine",
 ]
+
+# Trees no credential of yours is authored in. Skipped for speed. This is the only
+# kind of skipping done silently; anything that drops an actual finding is a
+# SUPPRESSOR, which is counted and shown.
+DENY = [
+    "Library/Caches", "Library/Containers", "Library/Group Containers",
+    "Library/Developer/CoreSimulator", "Library/Developer/Xcode/DerivedData",
+    "Library/Application Support/Docker Desktop",
+    "AppData/Local/Temp", "AppData/Local/Packages",
+    ".Trash", ".local/share/Trash", "$RECYCLE.BIN", ".cache",
+    "OrbStack", ".orbstack", ".docker/desktop", ".vagrant.d", "VirtualBox VMs",
+]
+
+
+def quick_roots() -> list[str]:
+    """The curated sweep: seconds rather than minutes."""
+    home = Path.home()
+    return [str(home / r) for r in QUICK_ROOTS if (home / r).exists()]
+
+
+def default_roots() -> list[str]:
+    """Everything you own. The deny-list, not an allow-list, decides what is out."""
+    return [str(Path.home())]
+
 
 # Rewriting shell history is its own kind of damage, so history files are
 # shown and redactable but never removable as a whole file.
-REDACT_ONLY = ("/.zsh_history", "/.bash_history")
+def norm_path(path: str) -> str:
+    """One spelling per file, whichever detector found it.
+
+    gitleaks reports forward slashes and os.walk reports the host separator, so on
+    Windows the same file arrived under two names, the (path, digest) dedupe never
+    matched, and every finding in a parseable file was reported twice."""
+    return os.path.normpath(str(path))
+
+
+def base_name(path: str) -> str:
+    """Final component, splitting on both separators. PurePath would use only the
+    host's separator, so a Windows path inspected on POSIX is one long filename and
+    every name-based guard below silently stops matching."""
+    return re.split(r"[\\/]", str(path))[-1]
+
+
+# Matched on the file name: the old suffix test looked for "/.bash_history",
+# which no Windows path contains, so the guard quietly did nothing there.
+REDACT_ONLY = frozenset({
+    ".zsh_history", ".bash_history", ".sh_history", ".history",
+    ".python_history", ".node_repl_history", ".psql_history", ".mysql_history",
+    "ConsoleHost_history.txt",
+})
 
 ACTIONS = ("remove", "redact", "ignore")
+
+# Editing these corrupts something. Terraform state is the clear case: the JSON
+# stays parseable after a line-level replace but no longer describes reality, and
+# the next apply destroys and recreates. Deleting the file is worse. So they are
+# reported, and the only honest action is to rotate the credential upstream.
+ROTATE_ONLY = re.compile(r"\.tfstate(\.backup)?$", re.IGNORECASE)
+
+# Formats where a successful write still has to produce a parseable document.
+STRUCTURED = {
+    ".json": json.loads,
+    ".tfstate": json.loads,
+}
+
+
+@dataclass(frozen=True)
+class Suppressor:
+    """A filter that drops a real finding.
+
+    These used to live in gitleaks.toml, where the effect was invisible: a scan
+    that filtered everything and a scan that found nothing both printed nothing.
+    One of them matched the *line* and so suppressed an AKIA access key id
+    embedded in a presigned S3 URL, and there was no way to see that had
+    happened. Now every drop is counted, attributed to a named rule, and can be
+    revealed or switched off.
+
+    `generic_only` is the structural half of that fix: a filter that reasons
+    about surrounding context may never overrule a typed, high-confidence rule."""
+
+    name: str
+    reason: str
+    pattern: re.Pattern
+    target: str = "secret"  # "secret" or "match" (the surrounding text gitleaks matched)
+    generic_only: bool = False
+
+    def hides(self, f: Finding) -> bool:
+        if self.generic_only and "generic" not in f.rule:
+            return False
+        return bool(self.pattern.search(f.secret if self.target == "secret" else f.match))
+
+
+SUPPRESSORS = [
+    Suppressor("placeholder", "documentation placeholder, not a value", re.compile(
+        r"""(?ix) ^(bearer\s+)? [<{\[]? (your|my)[-_ ] | ^[<{].+[>}]$
+            | (changeme|change[-_]me|replace[-_]?me|insert[-_]?your|placeholder
+               |redacted|^dummy|^sample[-_]|^example[-_]|^test[-_]token|^fake[-_])""")),
+    Suppressor("env-reference", "a pointer to a secret, not one",
+               re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")),
+    Suppressor("filler", "keyboard-mash or one character repeated", re.compile(
+        r"(?i)^(0?123456789|1234567890|abcdef|deadbeef|0123456789abcdef|1234567890abcdef)"
+        # Python has backreferences, unlike the RE2 engine gitleaks uses, so this
+        # is one pattern instead of the six spelled-out ones it replaces.
+        r"|^(.)\2{5,}$")),
+    Suppressor("aws-example-key", "the key id from AWS' own documentation",
+               re.compile(r"^AKIAIOSFODNN7EXAMPLE$")),
+    # Scoped to generic rules and to the surrounding text. An S3 presigned URL is a
+    # time-limited signature, but it carries a real AKIA id, and the typed
+    # aws-access-token hit for that id must survive this filter.
+    Suppressor("presigned-url", "an expiring S3 signature, not a stored credential",
+               re.compile(r"X-Amz-(Signature|Credential)="), target="match",
+               generic_only=True),
+]
+
+
+def partition(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
+    """Kept, and dropped-with-a-reason. Nothing leaves without being counted."""
+    kept, dropped = [], []
+    for f in findings:
+        hit = next((s for s in SUPPRESSORS if s.hides(f)), None)
+        if hit:
+            f.suppressed_by, f.suppressed_why = hit.name, hit.reason
+            dropped.append(f)
+        else:
+            kept.append(f)
+    return kept, dropped
 
 # The server is threaded, so two clicks can land at once. apply_actions and undo
 # both take this for their whole body, so the guarantee holds for any caller and
@@ -97,13 +211,18 @@ def _binary(name: str) -> str:
     scan-failure handlers already cover it."""
     found = shutil.which(name)
     if not found:
-        raise FileNotFoundError(f"{name} not found on PATH. Install it first: brew install {name}")
+        how = {"darwin": f"brew install {name}",
+               "win32": f"winget install {name}"}.get(sys.platform, f"your package manager: {name}")
+        raise FileNotFoundError(f"{name} not found on PATH. Install it first: {how}")
     return found
 
 # Files that exist only to hold credentials: removing the whole thing is right.
 # Anything else is a file you still want, so the default is to redact the line.
+# Matched against the name alone, so a backslash-separated path works too.
 CREDENTIAL_FILES = re.compile(
-    r"(^|/)(\.env[^/]*|\.netrc|\.npmrc|\.pypirc|credentials|id_[a-z0-9]+|[^/]+\.(pem|key|p12|pfx|jks))$"
+    r"^(\.env.*|\.netrc|_netrc|\.npmrc|\.pypirc|credentials|credentials\.tfrc\.json"
+    r"|auth\.json|\.pgpass|id_[a-z0-9]+|.+\.(pem|key|p12|pfx|jks|ovpn|keystore))$",
+    re.IGNORECASE,
 )
 
 
@@ -123,7 +242,16 @@ class Finding:
     end_line: int
     entropy: float
     secret: str = field(repr=False)
+    match: str = field(default="", repr=False)
+    # "pattern" (gitleaks matched a regex) or "schema" (we parsed the format and
+    # read a field that is a credential by definition). Different trust, so the
+    # UI ranks on it and can hide one.
+    detector: str = "pattern"
+    # Set only by an explicit --verify live run; ("", "") otherwise.
+    live: tuple[str, str] = ("", "")
     tracked: bool = False
+    suppressed_by: str = ""
+    suppressed_why: str = ""
 
     @property
     def digest(self) -> str:
@@ -141,11 +269,23 @@ class Finding:
     def suggested(self) -> str:
         """Pre-selected action. Never destructive by surprise: whole-file removal is
         only the default for files that are nothing but credential."""
-        return "remove" if self.removable and CREDENTIAL_FILES.search(self.path) else "redact"
+        if not self.editable:
+            return "ignore"
+        return "remove" if self.removable and CREDENTIAL_FILES.match(base_name(self.path)) else "redact"
 
     @property
     def removable(self) -> bool:
-        return not self.path.endswith(REDACT_ONLY)
+        return base_name(self.path) not in REDACT_ONLY and self.editable
+
+    @property
+    def editable(self) -> bool:
+        """False where any edit is worse than the leak it removes."""
+        return not ROTATE_ONLY.search(base_name(self.path))
+
+    @property
+    def state(self) -> tuple[str, str]:
+        """What can be known about this value without asking anyone."""
+        return offline_check(self.secret)
 
     def public(self) -> dict:
         return {
@@ -162,7 +302,13 @@ class Finding:
             "length": len(self.secret),
             "tracked": self.tracked,
             "removable": self.removable,
+            "editable": self.editable,
             "suggested": self.suggested,
+            "detector": self.detector,
+            "state": self.state[0],
+            "state_detail": self.state[1],
+            "live": self.live[0],
+            "live_detail": self.live[1],
         }
 
 
@@ -188,7 +334,13 @@ class Group:
         return all(m.removable for m in self.members)
 
     @property
+    def editable(self) -> bool:
+        return all(m.editable for m in self.members)
+
+    @property
     def suggested(self) -> str:
+        if not self.editable:
+            return "ignore"
         return "remove" if all(m.suggested == "remove" for m in self.members) else "redact"
 
     def public(self) -> dict:
@@ -208,7 +360,13 @@ class Group:
             "tracked": self.tracked,
             "tracked_copies": sum(m.tracked for m in self.members),
             "removable": self.removable,
+            "editable": self.editable,
             "suggested": self.suggested,
+            "detector": "schema" if any(m.detector == "schema" for m in self.members) else "pattern",
+            "state": self.lead.state[0],
+            "state_detail": self.lead.state[1],
+            "live": self.lead.live[0],
+            "live_detail": self.lead.live[1],
         }
 
 
@@ -217,7 +375,11 @@ def group_findings(findings: list[Finding]) -> list[Group]:
     for f in findings:
         by_value.setdefault(f.digest, []).append(f)
     groups = [Group(k, sorted(v, key=lambda m: m.path)) for k, v in by_value.items()]
-    return sorted(groups, key=lambda g: (not g.tracked, -len(g.members), g.lead.path))
+    # Exploitability, not presence: proven live first, then committed, then shape.
+    rank = {"live": 0, "": 1, "skipped": 1, "unknown": 1, "revoked": 3}
+    return sorted(groups, key=lambda g: (rank.get(g.lead.live[0], 2), not g.tracked,
+                                         g.lead.state[0] == "expired",
+                                         -len(g.members), g.lead.path))
 
 
 def mask(value: str) -> str:
@@ -303,7 +465,8 @@ def scan_root(root: Path) -> list[dict]:
 
 
 def scan(roots: list[str], progress: bool = False,
-         failures: list[str] | None = None) -> list[Finding]:
+         failures: list[str] | None = None,
+         suppressed: list[Finding] | None = None) -> list[Finding]:
     """A first run over a developer's whole code directory takes minutes, so say
     what is happening rather than looking hung."""
     wanted = [Path(r).expanduser() for r in roots]
@@ -316,7 +479,8 @@ def scan(roots: list[str], progress: bool = False,
     # The caller owns this list, so two concurrent scans cannot overwrite each
     # other's failures the way a module global did.
     failures = [] if failures is None else failures
-    del failures[:]
+    suppressed = [] if suppressed is None else suppressed
+    del failures[:], suppressed[:]
     raw: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(scan_root, p): p for p in paths}
@@ -347,7 +511,7 @@ def scan(roots: list[str], progress: bool = False,
 
     found: dict[str, Finding] = {}
     for h in raw:
-        path = h.get("SymlinkFile") or h["File"]
+        path = norm_path(h.get("SymlinkFile") or h["File"])
         f = Finding(
             fingerprint=h["Fingerprint"],
             path=path,
@@ -357,12 +521,358 @@ def scan(roots: list[str], progress: bool = False,
             end_line=h["EndLine"],
             entropy=h.get("Entropy", 0.0),
             secret=h["Secret"],
+            match=h.get("Match", ""),
         )
         found.setdefault(f.fingerprint, f)
 
-    for f in found.values():
+    # Schema parsers walk the same roots: a file gitleaks found nothing in can
+    # still be a kubeconfig full of credentials. Where both detectors see the same
+    # value in the same file, gitleaks' entry wins -- it carries the real line
+    # number, which is what redaction edits.
+    seen = {(f.path, f.digest) for f in found.values()}
+    skip = ignored_fingerprints()
+    for f in parse_roots(paths):
+        if f.fingerprint in skip or f"sv:{f.sha8}" in skip:
+            continue
+        if (f.path, f.digest) not in seen:
+            seen.add((f.path, f.digest))
+            found.setdefault(f.fingerprint, f)
+
+    found = {k: f for k, f in found.items() if f"sv:{f.sha8}" not in skip}
+    kept, dropped = partition(list(found.values()))
+    suppressed.extend(dropped)
+    if progress and dropped:
+        by_rule = Counter(f.suppressed_by for f in dropped)
+        print(f"  {len(dropped)} finding(s) suppressed: "
+              + ", ".join(f"{n} {k}" for k, n in by_rule.most_common()), flush=True)
+    for f in kept:
         f.tracked = git_tracked(f.path)
-    return sorted(found.values(), key=lambda f: (not f.tracked, f.path, f.start_line))
+    return sorted(kept, key=lambda f: (not f.tracked, f.path, f.start_line))
+
+
+# --------------------------------------------------------------------------- schema parsers
+#
+# gitleaks matches patterns against lines. That misses two whole categories: a
+# value whose variable name is not in its keyword list (cs=, setup_token=), and a
+# value inside a format where the field name already tells you it is a
+# credential. Parsing the format has no false positives to trade away -- a
+# kubeconfig client-key-data IS a private key -- so these run beside gitleaks
+# rather than instead of it, and carry detector="schema" so the UI can rank them
+# above a pattern match.
+
+# Names that are public by definition. Validated against a real corpus before it
+# shipped: on 15 .env files it keeps 14 candidates and drops 27, and the dropped
+# set is exactly URLs, anon keys, site keys, ids and display names.
+PUBLIC_NAME = re.compile(
+    # suffixes: what the value IS
+    r"(_URL|_URI|_HOST|_PORT|_ID|_NAME|_REGION|_BUCKET|_EMAIL|_USER|_ENV|_PATH|_DIR"
+    r"|_VERSION|_MODEL|CLIENT_ID)$"
+    # anywhere: a key that says on its face it is meant to be published. Anchoring
+    # these too let VITE_SUPABASE_ANON_KEY through, because it ends in _KEY.
+    r"|(PUBLIC|ANON|SITE_KEY|PUBLISHABLE)", re.IGNORECASE)
+PUBLIC_VALUE = re.compile(r"^(https?://|/|\./|\d+$|true$|false$|<|\$\{|~/)", re.IGNORECASE)
+ASSIGN = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.\-]*)\s*[=:]\s*(.+?)\s*$")
+
+# Field names that are a credential wherever they appear in a structured document.
+SECRET_FIELD = re.compile(
+    r"(password|passwd|secret|token|private[-_]?key|client[-_]?secret|access[-_]?key"
+    r"|credential|api[-_]?key|session|(^|[-_])auth([-_]|$))", re.IGNORECASE)
+
+# Names that contain a secret-ish word and are public by definition. A cluster's
+# certificate_authority matched "auth"; a CA certificate is meant to be handed out.
+NOT_SECRET_FIELD = re.compile(
+    r"(certificate_authority|ca_cert|authority_data|auth_provider|authentication_mode"
+    r"|token_endpoint|token_uri|auth_url|auth_uri|public_key|_fingerprint)", re.IGNORECASE)
+
+ENV_FILES = re.compile(r"^(\.env.*|.+\.env|\.npmrc|\.pypirc|\.netrc|_netrc|credentials"
+                       r"|connections\.toml|\.pgpass|\.aider\.conf\.yml|\.envrc)$", re.IGNORECASE)
+
+
+# An enum constant reads like a secret field's value but is one of a fixed set:
+# authentication_mode = API_AND_CONFIG_MAP is configuration, not a credential.
+ENUMISH = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _secret_shaped(value: str) -> bool:
+    return (len(value) >= 8 and " " not in value and not ENUMISH.match(value)
+            and not value.startswith(("arn:", "http://", "https://", "/", "{", "[")))
+
+
+def _plausible(name: str, value: str) -> bool:
+    value = value.strip().strip('"').strip("'")
+    return (len(value) >= 8 and not PUBLIC_NAME.search(name)
+            and not PUBLIC_VALUE.match(value) and " " not in value)
+
+
+def _mk(path: str, line: int, rule: str, desc: str, value: str) -> Finding:
+    path = norm_path(path)
+    return Finding(
+        fingerprint=f"{path}:{rule}:{line}:{hashlib.sha256(value.encode()).hexdigest()[:8]}",
+        path=path, rule=rule, description=desc, start_line=line, end_line=line,
+        entropy=0.0, secret=value, match=f"{rule} at line {line}", detector="schema")
+
+
+def parse_assignments(path: Path, text: str) -> list[Finding]:
+    """Every assignment in a file whose whole purpose is credentials. gitleaks'
+    generic rule keys off the variable name, so cs= and setup_token= are invisible
+    to it; in a .env the file name has already told us what the values are."""
+    out = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith(("#", ";")):
+            continue
+        m = ASSIGN.match(line)
+        if m and _plausible(m.group(1), m.group(2)):
+            out.append(_mk(str(path), i, "credential-file-assignment",
+                           f"{m.group(1)} in a file that exists to hold credentials",
+                           m.group(2).strip().strip('"').strip("'")))
+    return out
+
+
+def _walk_json(node: object, path: list[str]):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _walk_json(v, path + [str(k)])
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from _walk_json(v, path + [f"[{i}]"])
+    else:
+        yield ".".join(path), node
+
+
+# Wrappers that carry no meaning of their own: the name of an output is the key
+# above its "value", not the word "value".
+WRAPPER_KEYS = frozenset({"value", "attributes", "data", "instances", "resources",
+                          "outputs", "root_module", "values", "primary"})
+
+
+def _is_secret_field(name: str) -> bool:
+    return bool(SECRET_FIELD.search(name)) and not NOT_SECRET_FIELD.search(name)
+
+
+def _leaf_name(where: str) -> str:
+    for part in reversed(where.split(".")):
+        if part and not part.startswith("[") and part not in WRAPPER_KEYS:
+            return part
+    return ""
+
+
+def parse_tfstate(path: Path, text: str) -> list[Finding]:
+    """Terraform writes outputs and resource attributes to state in plaintext; the
+    `sensitive` flag hides them from CLI output and does not encrypt them. Values
+    are frequently base64, which defeats entropy scoring entirely."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return []
+    out, seen = [], set()
+
+    def add(name: str, value: str, why: str):
+        if _secret_shaped(value) and (name, value) not in seen:
+            seen.add((name, value))
+            out.append(_mk(str(path), 1, "tfstate-attribute",
+                           f"{name} in terraform state, {why}", value))
+
+    # Terraform's own signal, which needs no name heuristic at all.
+    for name, spec in (doc.get("outputs") or {}).items():
+        if isinstance(spec, dict) and spec.get("sensitive") and isinstance(spec.get("value"), str):
+            add(name, spec["value"], "an output marked sensitive and stored in plaintext")
+
+    for where, value in _walk_json(doc, []):
+        name = _leaf_name(where)
+        if isinstance(value, str) and _is_secret_field(name):
+            add(name, value, "stored in plaintext")
+    return out
+
+
+def parse_docker_config(path: Path, text: str) -> list[Finding]:
+    """auths[].auth is base64 of user:password. Not encryption, and gitleaks sees
+    one opaque blob."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return []
+    out = []
+    for registry, entry in (doc.get("auths") or {}).items():
+        blob = (entry or {}).get("auth")
+        if not blob:
+            continue
+        try:
+            decoded = base64.b64decode(blob + "==").decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - malformed base64 is just not a credential
+            continue
+        if ":" in decoded:
+            out.append(_mk(str(path), 1, "docker-registry-auth",
+                           f"base64 user:password for {registry}", decoded.split(":", 1)[1]))
+    return out
+
+
+def parse_kubeconfig(path: Path, text: str) -> list[Finding]:
+    """token, password and client-key-data live under users[].user. Parsed rather
+    than pattern-matched because removing one has to take its contexts with it."""
+    out = []
+    user, name = None, ""
+    for i, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("- name:"):
+            name = stripped.split(":", 1)[1].strip()
+        m = re.match(r"^\s*(token|password|client-key-data|id-token|refresh-token):\s*(\S+)", line)
+        if m and len(m.group(2)) >= 8:
+            out.append(_mk(str(path), i, "kubeconfig-credential",
+                           f"{m.group(1)} for user {name or '?'}", m.group(2)))
+    del user
+    return out
+
+
+def parse_container_env(path: Path, text: str) -> list[Finding]:
+    """ENV and ARG in a Dockerfile, environment: in a compose file. A literal here
+    is baked into an image or a repo."""
+    out = []
+    for i, line in enumerate(text.splitlines(), 1):
+        m = re.match(r"^\s*(?:ENV|ARG)\s+([A-Za-z_][\w]*)\s*=\s*(\S+)", line) \
+            or re.match(r"^\s*-?\s*([A-Z_][A-Z0-9_]{3,})\s*[:=]\s*(\S+)\s*$", line)
+        if m and _plausible(m.group(1), m.group(2)):
+            out.append(_mk(str(path), i, "container-env",
+                           f"{m.group(1)} set literally in a container definition",
+                           m.group(2).strip().strip('"').strip("'")))
+    return out
+
+
+# name-or-suffix -> parser. Checked against the file name, cheapest test first.
+PARSERS: list[tuple[re.Pattern, object]] = [
+    (re.compile(r"\.tfstate(\.backup)?$", re.I), parse_tfstate),
+    (re.compile(r"^config\.json$"), parse_docker_config),
+    (re.compile(r"^(config|kubeconfig)(\.ya?ml)?$", re.I), parse_kubeconfig),
+    (re.compile(r"^(docker-)?compose.*\.ya?ml$|^Dockerfile", re.I), parse_container_env),
+    (ENV_FILES, parse_assignments),
+]
+MAX_PARSE_BYTES = 8 << 20
+
+
+def parse_file(path: Path) -> list[Finding]:
+    """Run whichever parsers claim this file name. A parser that raises is a bug in
+    us, never a reason to lose the rest of the scan."""
+    name = base_name(str(path))
+    claims = [fn for rx, fn in PARSERS if rx.search(name)]
+    if not claims:
+        return []
+    try:
+        if path.stat().st_size > MAX_PARSE_BYTES:
+            return []
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[Finding] = []
+    for fn in claims:
+        try:
+            out += fn(path, text)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def ignored_fingerprints() -> set[str]:
+    """gitleaks applies .gitleaksignore to its own findings. The schema parsers are
+    ours, so the Ignore action has to reach them here or an ignored value comes
+    straight back on the next scan."""
+    if not IGNORE_FILE.exists():
+        return set()
+    try:
+        lines = IGNORE_FILE.read_text().splitlines()
+    except OSError:
+        return set()
+    return {ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")}
+
+
+@functools.lru_cache(maxsize=1)
+def skip_paths() -> list[re.Pattern]:
+    """The path skips, read out of the same gitleaks.toml that gitleaks is given.
+
+    One list, two consumers. Keeping a second copy in Python is how a downloaded
+    plugin marketplace ended up parsed but not pattern-scanned, and how 41
+    findings from somebody else's catalogue reached the table: only one of the two
+    filters knew the tree existed."""
+    try:
+        body = CONFIG_FILE.read_text()
+    except OSError:
+        return []
+    block = body.split("paths = [", 1)[-1].split("\n]", 1)[0] if "paths = [" in body else ""
+    out = []
+    for pat in re.findall(r"'''(.*?)'''", block, re.DOTALL):
+        try:
+            out.append(re.compile(pat))
+        except re.error:
+            continue
+    return out
+
+
+def is_skipped(path: str) -> bool:
+    """Compared with forward slashes so one set of patterns covers both platforms."""
+    return any(rx.search(str(path).replace("\\", "/")) for rx in skip_paths())
+
+
+def parse_roots(roots: list[Path]) -> list[Finding]:
+    """One metadata walk, pruned by exactly the trees gitleaks is told to skip."""
+    out: list[Finding] = []
+    for root in roots:
+        if root.is_file():
+            if not is_skipped(str(root)):
+                out += parse_file(root)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
+            dirnames[:] = [d for d in dirnames if not is_skipped(f"{dirpath}/{d}/")]
+            for fn in filenames:
+                full = Path(dirpath) / fn
+                if not is_skipped(str(full)):
+                    out += parse_file(full)
+    return out
+
+
+# --------------------------------------------------------------------------- offline checks
+#
+# "You have 92 secrets" is a list. "7 of these still parse as live credentials and
+# 3 expired in March" is a queue. Everything here reaches that second sentence
+# without a single packet: a JWT carries its own expiry, a private key either
+# parses or does not, an AWS key id has a fixed shape. Live verification -- asking
+# the provider -- lives in verify.py, which this module never imports, so the
+# scanner, the server and the UI keep their no-network guarantee structurally
+# rather than by policy.
+
+JWT_RE = re.compile(r"^[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*$")
+AWS_ID_RE = re.compile(r"^(AKIA|ASIA|AIDA|AROA|AGPA|ANPA|ANVA|APKA)[A-Z2-7]{16}$")
+
+
+def _b64pad(chunk: str) -> bytes:
+    return base64.urlsafe_b64decode(chunk + "=" * (-len(chunk) % 4))
+
+
+def offline_check(value: str) -> tuple[str, str]:
+    """(state, detail) with no network. States: live-shape, expired, malformed, unknown.
+
+    "live-shape" never means the credential works -- only that nothing locally
+    checkable rules it out. Nothing here is evidence of safety."""
+    v = value.strip()
+    if JWT_RE.match(v):
+        try:
+            claims = json.loads(_b64pad(v.split(".")[1]))
+        except Exception:  # noqa: BLE001
+            return "malformed", "looks like a JWT but the payload does not decode"
+        exp = claims.get("exp")
+        if isinstance(exp, (int, float)):
+            left = exp - datetime.now(timezone.utc).timestamp()
+            when = datetime.fromtimestamp(exp, timezone.utc).date().isoformat()
+            return ("expired", f"JWT expired {when}") if left <= 0 else \
+                   ("live-shape", f"JWT valid until {when}")
+        return "live-shape", "JWT with no expiry claim"
+    if AWS_ID_RE.match(v):
+        return "live-shape", "well-formed AWS key id"
+    if "BEGIN" in v and "PRIVATE KEY" in v:
+        body = "".join(ln for ln in v.splitlines() if "-----" not in ln)
+        try:
+            _b64pad(body.replace("/", "_").replace("+", "-"))
+        except Exception:  # noqa: BLE001
+            return "malformed", "PEM header present but the body does not decode"
+        return "live-shape", "private key, parses"
+    return "unknown", ""
 
 
 # --------------------------------------------------------------------------- actions
@@ -377,12 +887,72 @@ def _batch_dir() -> Path:
     return d
 
 
+def trash_rel(path: str | PurePath, flavour: type[PurePath] | None = None) -> PurePath:
+    """An absolute path encoded as a relative one, for storing inside a batch.
+
+    The root has to become an ordinary component. Joining a rooted path discards
+    everything to its left, so `batch / "files" / "C:/Users/x/.env"` is just
+    `C:/Users/x/.env` -- the computed trash destination was the original file,
+    and the move was a no-op that got recorded as a success. The same is true of
+    a UNC share, so the whole anchor is percent-encoded into one component rather
+    than guessed at: it is ugly in the tree and exactly reversible, which is the
+    right trade on a path that has to put your file back.
+
+    POSIX keeps the layout it always had, so batches from earlier versions still
+    restore. `flavour` exists so the Windows behaviour is testable from a POSIX
+    machine, which is the only way this stays correct between Windows CI runs."""
+    cls = flavour or PurePath
+    q = cls(path)
+    rest = str(q)[len(q.anchor):]
+    if q.anchor in ("", "/"):
+        return cls(rest)
+    return cls(quote(q.anchor, safe=""), rest)
+
+
+def trash_abs_pure(rel: PurePath, windows: bool) -> PurePath:
+    """Inverse of trash_rel, as pure path arithmetic.
+
+    Split out from trash_abs so both platforms' behaviour can be asserted from
+    either platform: pathlib.Path is whatever the host is, so a POSIX round trip
+    checked on Windows silently compares backslashes to slashes and passes or
+    fails for the wrong reason."""
+    parts = tuple(rel.parts)
+    if windows and parts:
+        return PureWindowsPath(unquote(parts[0]), *parts[1:])
+    return PurePosixPath("/", *parts)
+
+
+def trash_abs(rel: PurePath) -> Path:
+    """The same thing as a real path on the platform that wrote the batch."""
+    return Path(trash_abs_pure(rel, os.name == "nt"))
+
+
 def _stash(batch: Path, src: Path) -> Path:
     """Copy a file into the batch preserving its absolute path, so undo is a reversal."""
-    dest = batch / "files" / str(src).lstrip("/")
+    dest = batch / "files" / trash_rel(src)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     return dest
+
+
+def _parse_error(path: Path) -> str:
+    """Empty string when the file still parses as whatever its name claims.
+
+    Matched on the whole name rather than PurePath.suffix: a file called `.json`
+    has no suffix at all, and `terraform.tfstate.backup` has `.backup`, so a
+    suffix lookup silently skips the check on exactly the files most worth
+    checking."""
+    name = base_name(str(path)).lower()
+    parser = next((fn for ext, fn in STRUCTURED.items()
+                   if name == ext.lstrip(".") or name.endswith(ext)
+                   or f"{ext}." in name), None)
+    if not parser:
+        return ""
+    try:
+        parser(path.read_text(encoding="utf-8", errors="surrogateescape"))
+    except (ValueError, OSError) as e:
+        return str(e)[:80]
+    return ""
 
 
 def redact_lines(lines: list[str], f: Finding) -> tuple[list[str], bool]:
@@ -450,8 +1020,14 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
 
     # Redact first: a file also queued for removal is skipped, not double-handled.
     by_file: dict[str, list[Finding]] = {}
+    blocked = [(f, a) for f, a in chosen if a != "ignore" and not f.editable]
+    results += [{"fingerprint": f.fingerprint, "ok": False,
+                 "detail": "terraform state: rotate the credential, editing state corrupts it"}
+                for f, _ in blocked]
+    stop = {f.fingerprint for f, _ in blocked}
+
     for f, a in chosen:
-        if a == "redact" and f.path not in remove:
+        if a == "redact" and f.path not in remove and f.fingerprint not in stop:
             by_file.setdefault(f.path, []).append(f)
 
     for path, group in by_file.items():
@@ -461,6 +1037,7 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
             continue
         lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
         changed = False
+        mark = len(entries)
         for f in sorted(group, key=lambda f: -f.start_line):
             lines, ok = redact_lines(lines, f)
             results.append({
@@ -475,11 +1052,26 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
         # would leave an orphaned copy of the secret in the trash and bump the
         # mtime of a file we did not edit. The original is still on disk here.
         if changed:
-            _stash(batch, src)
+            stashed = _stash(batch, src)
             src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
+            # A line-level replace inside a structured document can leave it
+            # unparseable. Check, and put the original back rather than hand the
+            # user a broken kubeconfig in exchange for a redacted line.
+            broke = _parse_error(src)
+            if broke:
+                shutil.copy2(stashed, src)
+                for r in results[-len(group):]:
+                    r["ok"], r["detail"] = False, f"left alone: editing it broke the file ({broke})"
+                # The rollback un-did every edit to this file, so the manifest must
+                # not keep claiming them: undo would otherwise "restore" a file
+                # that was never changed, over whatever is there by then.
+                del entries[mark:]
+                stashed.unlink(missing_ok=True)
 
     moved: set[str] = set()
     for f, a in chosen:
+        if f.fingerprint in stop:
+            continue
         if a == "remove":
             if not f.removable:
                 results.append({"fingerprint": f.fingerprint, "ok": False,
@@ -490,20 +1082,20 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
             elif not Path(f.path).exists():
                 results.append({"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"})
             else:
-                dest = batch / "files" / f.path.lstrip("/")
+                dest = batch / "files" / trash_rel(f.path)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(f.path, dest)  # move, never unlink
                 moved.add(f.path)
                 entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
                 results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
         elif a == "ignore":
-            add_ignore(f.fingerprint)
+            add_ignore(f)
             results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
 
     # A redaction on a file that was also removed never ran, but the value went with
     # the file. Say so, rather than leaving that row with no outcome at all.
     for f, a in chosen:
-        if a == "redact" and f.path in remove:
+        if a == "redact" and f.path in remove and f.fingerprint not in stop:
             gone = f.path in moved
             results.append({
                 "fingerprint": f.fingerprint, "ok": gone,
@@ -538,13 +1130,21 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
     return {"batch": batch.name if batch else None, "results": results}
 
 
-def add_ignore(fingerprint: str) -> None:
-    """gitleaks' own ignore format: fingerprints, never values."""
+def add_ignore(f: Finding) -> None:
+    """gitleaks' own ignore format: fingerprints, never values.
+
+    Two lines, because there are two detectors. The fingerprint is what gitleaks
+    itself honours. The `sv:` line is a SHA-256 prefix of the value, which is how
+    the schema parsers honour it -- without it, ignoring the gitleaks hit simply
+    let our own finding for the same value take its place on the next scan. It
+    also matches what the UI says the button does: the row is a value, and the
+    action applies to every copy. gitleaks ignores a line it cannot parse."""
     IGNORE_FILE.parent.mkdir(parents=True, exist_ok=True)
     current = IGNORE_FILE.read_text().splitlines() if IGNORE_FILE.exists() else []
-    if fingerprint not in current:
-        with IGNORE_FILE.open("a") as fh:
-            fh.write(fingerprint + "\n")
+    with IGNORE_FILE.open("a") as fh:
+        for line in (f.fingerprint, f"sv:{f.sha8}"):
+            if line not in current:
+                fh.write(line + "\n")
 
 
 def batches() -> list[Path]:
@@ -575,7 +1175,7 @@ def undo(batch: Path | None = None) -> dict:
         for src in sorted(files.rglob("*")):
             if not src.is_file():
                 continue
-            dest = Path("/") / src.relative_to(files)
+            dest = trash_abs(src.relative_to(files))
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), dest)
@@ -588,6 +1188,123 @@ def undo(batch: Path | None = None) -> dict:
             return {"ok": False, "detail": f"restored {restored}, {stuck} could not be put back"}
         shutil.rmtree(batch, ignore_errors=True)
         return {"ok": True, "detail": f"restored {restored} file(s) from {batch.name}"}
+
+
+# --------------------------------------------------------------------------- report-only
+#
+# Three places a credential can sit where deletion is not the answer. An exported
+# variable has no file to remove; a container's environment belongs to the
+# container; the OS keystore is where secrets are *supposed* to live. Reporting
+# them is still worth doing, because "it is not in a file" is exactly why people
+# forget they are there.
+
+CRED_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API[-_]?KEY|_KEY$"
+                       r"|PRIVATE|SESSION|COOKIE|BEARER|_PAT$|SIGNING)", re.IGNORECASE)
+# Canonical UUID only. Matching any long hex string would drop real tokens, which
+# are frequently 32 hex characters.
+UUIDISH = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def env_report(environ: dict | None = None, roots: list[str] | None = None) -> list[dict]:
+    """Credential-shaped variables, each traced back to the file that set it.
+
+    Three outcomes, and the middle one is the reason this exists: a value with no
+    file behind it cannot be fixed by anything else this tool does."""
+    environ = os.environ if environ is None else environ
+    sources = [Path(r) for r in (roots or quick_roots())]
+    files = [p for p in sources if p.is_file()]
+    out = []
+    for name, value in sorted(environ.items()):
+        # The name is the actionable signal. A high-entropy value under a name
+        # that claims nothing is as likely to be a socket path or an instance id,
+        # and this report exists to be acted on rather than skimmed past.
+        if (not _secret_shaped(value) or len(value) < 16 or UUIDISH.match(value)
+                or PUBLIC_NAME.search(name) or not CRED_NAME.search(name)):
+            continue
+        holders = []
+        for f in files:
+            try:
+                if value in f.read_text(errors="replace"):
+                    holders.append(display_path(str(f)))
+            except OSError:
+                continue
+        out.append({
+            "name": name, "length": len(value), "sha8": hashlib.sha256(value.encode()).hexdigest()[:8],
+            "sources": holders,
+            "advice": (f"remove it from {holders[0]}, then `unset {name}` in shells already running"
+                       if holders else
+                       f"no file on this machine sets this; `unset {name}` clears it here only"),
+        })
+    return out
+
+
+def docker_report() -> list[dict]:
+    """Variable names and image per running container. Never a value: the point is
+    to remind you the container has them, not to copy them out."""
+    try:
+        ids = subprocess.run([_binary("docker"), "ps", "-q"], capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if ids.returncode != 0 or not ids.stdout.strip():
+        return []
+    out = []
+    for cid in ids.stdout.split():
+        try:
+            r = subprocess.run([_binary("docker"), "inspect", cid], capture_output=True,
+                               text=True, timeout=10)
+            spec = json.loads(r.stdout)[0]
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError, KeyError):
+            continue
+        names = [e.split("=", 1)[0] for e in (spec.get("Config", {}).get("Env") or [])
+                 if CRED_NAME.search(e.split("=", 1)[0])]
+        if names:
+            out.append({"container": spec.get("Name", cid).lstrip("/"),
+                        "image": spec.get("Config", {}).get("Image", "?"), "names": sorted(names)})
+    return out
+
+
+def keystore_report() -> list[dict]:
+    """Item and service names only. Nothing here reads a value, and there is no
+    delete action: the keystore is the right place for a secret to be."""
+    if sys.platform == "darwin":
+        cmd, pat = ["security", "dump-keychain"], re.compile(r'"svce"<blob>="([^"]*)"')
+    elif os.name == "nt":
+        cmd, pat = ["cmdkey", "/list"], re.compile(r"Target:\s*(\S+)")
+    else:
+        return []
+    try:
+        # No -d: attributes only, so this never asks for a value and never prompts.
+        r = subprocess.run([_binary(cmd[0]), *cmd[1:]], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    counts = Counter(m for m in pat.findall(r.stdout) if m)
+    return [{"service": k, "items": n} for k, n in counts.most_common(40)]
+
+
+def print_report(env_rows: list[dict], docker_rows: list[dict], keys: list[dict]) -> None:
+    traced = [r for r in env_rows if r["sources"]]
+    orphan = [r for r in env_rows if not r["sources"]]
+    print(f"\n{len(env_rows)} credential-shaped environment variable(s).")
+    for label, rows in (("set by a file you can fix", traced), ("no file sets these", orphan)):
+        if not rows:
+            continue
+        print(f"\n  {label}:")
+        for r in rows:
+            where = ", ".join(r["sources"]) if r["sources"] else "-"
+            print(f"    {r['name']:<34} {r['sha8']}  {where}")
+            print(f"        {r['advice']}")
+    print("\n  Redacting the file does not change a shell that is already running.")
+    if docker_rows:
+        print(f"\n{len(docker_rows)} running container(s) hold credential-shaped variables:")
+        for d in docker_rows:
+            print(f"    {d['container']:<28} {d['image'][:38]:<40} {', '.join(d['names'])[:60]}")
+    if keys:
+        print(f"\n{sum(k['items'] for k in keys)} keystore item(s) across {len(keys)} service(s). "
+              "This is where secrets belong; nothing to remove.")
+        for k in keys[:12]:
+            print(f"    {k['service'][:52]:<54} {k['items']}")
 
 
 # --------------------------------------------------------------------------- server
@@ -657,9 +1374,10 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/rescan":
             git_tracked.cache_clear()  # a file may have been committed since the last scan
             failures: list[str] = []
+            dropped: list[Finding] = []
             try:
-                found = scan(self.state["roots"], failures=failures)
-                published = _scan_state(found, failures)
+                found = scan(self.state["roots"], failures=failures, suppressed=dropped)
+                published = _scan_state(found, failures, dropped)
             except (RuntimeError, OSError) as e:
                 # scan raises when no root could be read at all, and grouping
                 # shells out to git. Answer with the reason rather than dropping
@@ -705,10 +1423,12 @@ class Handler(BaseHTTPRequestHandler):
             "gitleaks": self.state["gitleaks"],
             "batches": [b.name for b in batches()],
             "failures": list(scanned["failures"]),
+            "suppressed": scanned["suppressed"],
         }
 
 
-def _scan_state(findings: list[Finding], failures: list[str] | None) -> dict:
+def _scan_state(findings: list[Finding], failures: list[str] | None,
+                suppressed: list[Finding] | None = None) -> dict:
     """Everything a rescan replaces, in one object. Assigning groups, failures and
     the timestamp separately lets a reader pair one scan's findings with another
     scan's failure list, and a run whose roots could not be read would then show
@@ -717,14 +1437,16 @@ def _scan_state(findings: list[Finding], failures: list[str] | None) -> dict:
     return {
         "groups": {g.key: g for g in group_findings(findings)},
         "failures": list(failures or []),
+        "suppressed": suppression_summary(suppressed or []),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
 
 def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
-          open_browser: bool = True, failures: list[str] | None = None) -> str:
+          open_browser: bool = True, failures: list[str] | None = None,
+          suppressed: list[Finding] | None = None) -> str:
     Handler.state = {
-        "scan": _scan_state(findings, failures),
+        "scan": _scan_state(findings, failures, suppressed),
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
@@ -746,10 +1468,49 @@ def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
 # --------------------------------------------------------------------------- cli
 
 
-def print_table(findings: list[Finding], failures: list[str] | None = None) -> None:
+def suppression_summary(suppressed: list[Finding]) -> list[dict]:
+    """What was filtered, by rule. The UI renders this and can reveal it; the point
+    is that a scan which filtered everything never again looks like a clean one."""
+    by_rule: dict[str, list[Finding]] = {}
+    for f in suppressed:
+        by_rule.setdefault(f.suppressed_by, []).append(f)
+    return sorted(
+        ({"rule": k, "reason": v[0].suppressed_why, "count": len(v),
+          "paths": sorted({display_path(m.path) for m in v})[:50]} for k, v in by_rule.items()),
+        key=lambda r: -r["count"])
+
+
+def run_live_verification(findings: list[Finding]) -> list[Finding]:
+    """Opt-in, and loud about it. verify.py is imported here and nowhere else, so
+    the scanner and server have no network capability to misuse."""
+    import verify  # noqa: PLC0415 - deliberately not a module-level import
+
+    rules = sorted({f.rule for f in findings if verify.verifiable(f.rule)})
+    if not rules:
+        print("  nothing here has a verifier; leaving them as offline checks only")
+        return findings
+    print(f"  asking {', '.join(verify.destinations(rules))} whether these still work.")
+    print("  this is a real request with your credential and lands in their audit log.")
+    canaries = verify.load_registry(STATE / "canaries.txt")
+    done: dict[str, tuple[str, str]] = {}
+    for f in findings:
+        if not verify.verifiable(f.rule):
+            continue
+        if verify.is_canary(f.secret, f.path, canaries):
+            f.live = ("skipped", "looks like a honeytoken; verifying one is the alarm")
+            continue
+        if f.digest not in done:  # one request per distinct value, never per copy
+            done[f.digest] = verify.verify(f.rule, f.secret)
+        f.live = done[f.digest]
+    return findings
+
+
+def print_table(findings: list[Finding], failures: list[str] | None = None,
+                suppressed: list[Finding] | None = None) -> None:
     groups = group_findings(findings)
     if not groups:
         print("No secrets found.")
+        _print_suppressed(suppressed)
         return
     print(f"{'VALUE':<18}  {'RULE':<24}  {'COPIES':>6}  {'FLAGS':<10}  FIRST SEEN")
     for g in groups:
@@ -761,43 +1522,79 @@ def print_table(findings: list[Finding], failures: list[str] | None = None) -> N
     tracked = sum(g.tracked for g in groups)
     print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
           f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
+    _print_suppressed(suppressed)
+
+
+def _print_suppressed(suppressed: list[Finding] | None) -> None:
+    for row in suppression_summary(suppressed or []):
+        print(f"  suppressed {row['count']:>4}  {row['rule']:<16} {row['reason']}")
+    if suppressed:
+        print("  re-run with --no-filter to see them.")
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="secret-vacuum", description=__doc__.splitlines()[0])
-    ap.add_argument("command", nargs="?", default="ui", choices=("ui", "scan", "undo"))
+    ap.add_argument("command", nargs="?", default="ui",
+                    choices=("ui", "scan", "undo", "env"))
     ap.add_argument("--root", action="append", default=[], metavar="PATH",
                     help="scan this path instead of the defaults (repeatable)")
     ap.add_argument("--apply", action="store_true", help="allow changes; without it the UI is read only")
     ap.add_argument("--json", action="store_true", help="with scan: emit findings as JSON (masked, never values)")
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    ap.add_argument("--quick", action="store_true",
+                    help="scan the known credential stores only, not the whole home directory")
+    ap.add_argument("--verify", choices=("never", "offline", "live"), default="offline",
+                    help="offline (default) checks shape and expiry with no network; "
+                         "live also asks each provider, which writes to their audit log")
+    ap.add_argument("--docker", action="store_true",
+                    help="with env: also list credential-shaped variables in running containers")
+    ap.add_argument("--keychain", action="store_true",
+                    help="with env: also inventory the OS keystore (names only, never values)")
+    ap.add_argument("--no-filter", action="store_true",
+                    help="report every finding, including the ones the suppressors would drop")
     a = ap.parse_args(argv)
+
+    if a.command == "env":
+        print_report(env_report(roots=a.root or None),
+                     docker_report() if a.docker else [],
+                     keystore_report() if a.keychain else [])
+        return 0
 
     if a.command == "undo":
         r = undo()
         print(r["detail"])
         return 0 if r["ok"] else 1
 
-    roots = a.root or DEFAULT_ROOTS
+    if a.no_filter:
+        SUPPRESSORS.clear()
+    roots = a.root or (quick_roots() if a.quick else default_roots())
     failures: list[str] = []
+    dropped: list[Finding] = []
     try:
         if not (a.command == "scan" and a.json):
-            print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  scanning {len(roots)} root(s)...")
+            scope = "quick" if a.quick else ("custom" if a.root else "home")
+            print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  "
+                  f"{scope} scope, {len(roots)} root(s)...")
         findings = scan(roots, progress=not (a.command == "scan" and a.json),
-                        failures=failures)
+                        failures=failures, suppressed=dropped)
     except (RuntimeError, OSError) as e:
         # Every root failed, or the scanner is not installed at all. Say why,
         # rather than printing a traceback.
         return print(f"scan failed: {e}", file=sys.stderr) or 2
 
+    if a.verify == "live":
+        findings = run_live_verification(findings)
+
     if a.command == "scan":
         if a.json:
-            print(json.dumps([g.public() for g in group_findings(findings)], indent=1))
+            print(json.dumps({"findings": [g.public() for g in group_findings(findings)],
+                              "suppressed": suppression_summary(dropped)}, indent=1))
         else:
-            print_table(findings, failures)
+            print_table(findings, failures, dropped)
         return 0
 
-    serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures)
+    serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures,
+          suppressed=dropped)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
