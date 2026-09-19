@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>secret-vacuum</title>
+<style>
+  :root {
+    --ground:#eef1f2; --surface:#fff; --sunk:#e4e9eb; --ink:#14191c; --soft:#4a575e;
+    --faint:#76858c; --rule:#d2dadd; --hazard:#b87503; --hazard-bg:#fbf1dc;
+    --danger:#a8321f; --danger-bg:#fae9e5; --safe:#1f6b4c; --safe-bg:#e2f0e9;
+    --mono:"SF Mono",ui-monospace,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --ground:#0f1417; --surface:#171e22; --sunk:#121a1e; --ink:#e4eaed; --soft:#a3b1b8;
+    --faint:#74858d; --rule:#2a353b; --hazard:#e2a32c; --hazard-bg:#2b2109;
+    --danger:#e4705c; --danger-bg:#2e1512; --safe:#5db98d; --safe-bg:#0e2419;
+  }}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font:14px/1.5 var(--sans)}
+  header{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--rule);
+    padding:14px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+  h1{font-size:15px;margin:0;letter-spacing:-.01em}
+  h1 span{color:var(--faint);font-weight:400}
+  .grow{flex:1}
+  .mode{font:11px/1 var(--mono);text-transform:uppercase;letter-spacing:.08em;padding:5px 9px;border-radius:3px}
+  .mode.preview{background:var(--sunk);color:var(--soft)}
+  .mode.apply{background:var(--danger-bg);color:var(--danger)}
+  .bar{padding:12px 20px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+    border-bottom:1px solid var(--rule);background:var(--surface)}
+  input[type=search]{flex:1;min-width:160px;padding:7px 10px;border:1px solid var(--rule);
+    border-radius:4px;background:var(--ground);color:var(--ink);font:13px var(--sans)}
+  button{font:13px var(--sans);padding:7px 13px;border-radius:4px;border:1px solid var(--rule);
+    background:var(--surface);color:var(--ink);cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--faint)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.primary{background:var(--danger);border-color:var(--danger);color:#fff;font-weight:600}
+  button.primary:hover:not(:disabled){filter:brightness(1.1)}
+  .wrap{padding:0 20px 60px}
+  .tbl-scroll{overflow-x:auto}
+  td.num,th.num{font-variant-numeric:tabular-nums;text-align:right;padding-right:14px}
+  .more{font:11px var(--mono);color:var(--faint);cursor:pointer;margin-top:3px}
+  .locs{font:11.5px var(--mono);color:var(--soft);margin:5px 0 2px;max-height:180px;overflow:auto}
+  table{width:100%;border-collapse:collapse;margin-top:4px}
+  th{font:10.5px var(--mono);text-transform:uppercase;letter-spacing:.09em;color:var(--faint);
+    text-align:left;padding:10px 10px 8px 0;border-bottom:1px solid var(--rule);white-space:nowrap}
+  td{padding:9px 10px 9px 0;border-bottom:1px solid var(--rule);vertical-align:top}
+  tr.gone{opacity:.35}
+  .path{font:12.5px var(--mono);word-break:break-all}
+  .rule{font:11px var(--mono);color:var(--soft)}
+  .val{font:12.5px var(--mono);color:var(--soft);white-space:nowrap}
+  .tag{display:inline-block;font:10px var(--mono);text-transform:uppercase;letter-spacing:.05em;
+    padding:2px 6px;border-radius:2px;white-space:nowrap}
+  .tag.committed{background:var(--hazard-bg);color:var(--hazard)}
+  .tag.ok{background:var(--safe-bg);color:var(--safe)}
+  .tag.fail{background:var(--danger-bg);color:var(--danger)}
+  select{font:12px var(--sans);padding:4px 6px;border:1px solid var(--rule);border-radius:3px;
+    background:var(--surface);color:var(--ink)}
+  .note{background:var(--hazard-bg);color:var(--hazard);border-left:3px solid var(--hazard);
+    padding:11px 14px;margin:14px 0;font-size:13px}
+  .empty{padding:60px 0;text-align:center;color:var(--faint)}
+  footer{padding:14px 20px;color:var(--faint);font:11.5px var(--mono);border-top:1px solid var(--rule)}
+  @media (max-width:640px){th.hide,td.hide{display:none}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>secret&#8209;vacuum <span id="count"></span></h1>
+  <div class="grow"></div>
+  <span id="mode" class="mode preview">loading</span>
+</header>
+
+<div class="bar">
+  <input type="search" id="filter" placeholder="Filter by path or rule" autocomplete="off">
+  <label><input type="checkbox" id="onlyCommitted"> committed only</label>
+  <button id="all">Select all</button>
+  <button id="none">Clear</button>
+  <div class="grow"></div>
+  <button id="rescan">Rescan</button>
+  <button id="undo">Undo last</button>
+  <button id="apply" class="primary" disabled>Apply</button>
+</div>
+
+<div class="wrap">
+  <div id="banner"></div>
+  <div class="tbl-scroll">
+  <table id="tbl" hidden>
+    <thead><tr>
+      <th style="width:28px"></th><th class="hide">Value</th><th>Where it is</th>
+      <th>Rule</th><th class="num">Copies</th><th>Flags</th><th>Action</th><th>Result</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  </div>
+  <div class="empty" id="empty">Scanning&hellip;</div>
+</div>
+
+<footer id="foot"></footer>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get("t") || "";
+const $ = (id) => document.getElementById(id);
+// Paths and rule text come off the filesystem, so a crafted filename must not
+// become markup. Everything interpolated into innerHTML goes through this.
+const esc = (v) =>
+  String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+let state = { findings: [], apply: false }, results = {};
+
+const api = async (path, body) => {
+  const r = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: { "X-SV-Token": TOKEN, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return r.json();
+};
+
+function visible() {
+  const q = $("filter").value.trim().toLowerCase();
+  const only = $("onlyCommitted").checked;
+  return state.findings.filter(
+    (f) =>
+      (!only || f.tracked) &&
+      (!q || f.rule.includes(q) || f.paths.some((p) => p.toLowerCase().includes(q)))
+  );
+}
+
+function render() {
+  const rows = visible();
+  const n = state.findings.length;
+  $("count").textContent = n
+    ? `${n} distinct secret${n === 1 ? "" : "s"} across ${state.locations} location${state.locations === 1 ? "" : "s"}`
+    : "";
+  $("mode").textContent = state.apply ? "apply mode" : "preview, read only";
+  $("mode").className = "mode " + (state.apply ? "apply" : "preview");
+
+  const committed = state.findings.filter((f) => f.tracked).length;
+  const failed = (state.failures || []).length
+    ? `<div class="note"><b>${state.failures.length} root(s) could not be scanned.</b>
+       A root that failed is not a root that is clean.<div class="locs">${
+         state.failures.map(esc).join("<br>")}</div></div>`
+    : "";
+  $("banner").innerHTML = failed + (committed
+    ? `<div class="note"><b>${committed} of these appear in a committed file.</b> Removing the file here does
+       not unleak the value. It is in every clone and in the history. Rotate those credentials.
+       They are still removable; you just need to know that removing is not enough.</div>`
+    : "");
+
+  $("tbl").hidden = rows.length === 0;
+  $("empty").hidden = rows.length > 0;
+  $("empty").textContent = state.findings.length
+    ? "Nothing matches this filter."
+    : "No plaintext secrets found in the scanned roots.";
+
+  $("rows").innerHTML = rows
+    .map((f) => {
+      const r = results[f.key];
+      const opts = ["remove", "redact", "ignore"]
+        .map((a) => {
+          const off = a === "remove" && !f.removable;
+          const sel = a === f.suggested ? " selected" : "";
+          return `<option value="${a}"${sel}${off ? " disabled" : ""}>${a}</option>`;
+        })
+        .join("");
+      return `<tr class="${r && r.ok ? "gone" : ""}">
+        <td><input type="checkbox" class="pick" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}></td>
+        <td class="hide val" title="${f.length} chars">${esc(f.masked)}</td>
+        <td><div class="path">${esc(f.display)}:${f.line}</div>
+            <div class="rule">${f.copies > 1
+              ? `and ${f.copies - 1} more ${f.copies === 2 ? "copy" : "copies"} &middot; ${esc(f.description)}`
+              : esc(f.description)}</div>
+            ${f.copies > 1 ? `<details><summary class="more">all ${f.copies} locations</summary>
+              <div class="locs">${f.paths.map(esc).join("<br>")}</div></details>` : ""}</td>
+        <td class="rule">${esc(f.rule)}</td>
+        <td class="num val">${f.copies}</td>
+        <td>${f.tracked ? '<span class="tag committed">committed</span>' : ""}
+            ${!f.removable ? '<span class="tag">history</span>' : ""}</td>
+        <td><select class="act" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}>${opts}</select></td>
+        <td>${r ? `<span class="tag ${r.ok ? "ok" : "fail"}">${esc(r.detail)}</span>` : ""}</td>
+      </tr>`;
+    })
+    .join("");
+
+  $("foot").textContent =
+    `gitleaks ${state.gitleaks || "?"} · scanned ${state.scanned_at || "?"} · ` +
+    `roots: ${(state.roots || []).join("  ")} · ${(state.batches || []).length} trash batch(es)`;
+  syncApply();
+}
+
+const picked = () => [...document.querySelectorAll(".pick:checked")].map((c) => c.dataset.fp);
+
+function syncApply() {
+  const n = picked().length;
+  $("apply").disabled = n === 0 || !state.apply;
+  $("apply").textContent = state.apply ? (n ? `Apply to ${n} selected` : "Apply") : "Preview mode";
+  $("apply").title = state.apply ? "" : "Restart with --apply to make changes";
+}
+
+async function load(path, body) {
+  $("empty").textContent = "Scanning…";
+  const data = await api(path, body);
+  if (data.error) {
+    $("empty").textContent = data.error;
+    $("empty").hidden = false;
+    if (!data.findings) return;
+  }
+  if (data.results) for (const r of data.results) results[r.key] = r;
+  state = data;
+  render();
+}
+
+$("rows").addEventListener("change", syncApply);
+$("filter").addEventListener("input", render);
+$("onlyCommitted").addEventListener("change", render);
+$("all").onclick = () => { document.querySelectorAll(".pick:not(:disabled)").forEach((c) => (c.checked = true)); syncApply(); };
+$("none").onclick = () => { document.querySelectorAll(".pick").forEach((c) => (c.checked = false)); syncApply(); };
+$("rescan").onclick = () => { results = {}; load("/api/rescan", {}); };
+$("undo").onclick = () => load("/api/undo", {});
+$("apply").onclick = () => {
+  const acts = picked().map((fp) => ({
+    key: fp,
+    action: document.querySelector(`.act[data-fp="${fp}"]`).value,
+  }));
+  const copies = acts.reduce(
+    (t, a) => t + (state.findings.find((f) => f.key === a.key)?.copies || 0), 0);
+  if (!confirm(`Apply to ${acts.length} secret(s) across ${copies} file location(s)?\n\n` +
+               `Undo restores everything from this batch.`)) return;
+  load("/api/apply", { actions: acts });
+};
+
+load("/api/findings");
+</script>
+</body>
+</html>
