@@ -1360,6 +1360,9 @@ def test_terraform_state_is_reported_but_never_edited(tmp_path: Path):
     f = finding(str(state), FAKE_STRIPE)
     assert not f.editable and not f.removable
     assert f.suggested == "ignore"
+    # and the grouped row the UI actually renders, which had its own default
+    g = sv.group_findings([f])[0]
+    assert not g.editable and g.suggested == "ignore", g.public()["suggested"]
     before = state.read_text()
     for action in ("remove", "redact"):
         out = act(action, f)

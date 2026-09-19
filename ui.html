@@ -60,7 +60,8 @@
   .tag.dead{background:var(--sunk);color:var(--faint)}
   .tag.rotate{background:var(--hazard-bg);color:var(--hazard)}
   .tag.schema{background:var(--safe-bg);color:var(--safe)}
-  .note:not(:empty){font:12px var(--sans);color:var(--soft);margin:0 0 8px}
+  .note:empty{display:none}
+  #note:not(:empty){font:12px var(--sans);color:var(--soft);margin:0 0 8px}
   select{font:12px var(--sans);padding:4px 6px;border:1px solid var(--rule);border-radius:3px;
     background:var(--surface);color:var(--ink)}
   .note{background:var(--hazard-bg);color:var(--hazard);border-left:3px solid var(--hazard);

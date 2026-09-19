@@ -330,6 +330,8 @@ class Group:
 
     @property
     def suggested(self) -> str:
+        if not self.editable:
+            return "ignore"
         return "remove" if all(m.suggested == "remove" for m in self.members) else "redact"
 
     def public(self) -> dict:
