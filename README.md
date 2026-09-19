@@ -45,6 +45,12 @@ Three actions per secret:
 | **redact** | the file is copied to the trash, then the secret is replaced in place with `<removed by secret-vacuum>` | `.zshrc`, `settings.json`, `.mcp.json`: one bad line in a file you need |
 | **ignore** | each copy's fingerprint is appended to `~/.secret-vacuum/.gitleaksignore` | false positives: presigned URLs, UUIDs, pagination cursors, content hashes |
 
+Each row is pre-set to the safer of the two: whole-file **remove** only for files that are nothing
+but credential, **redact** for everything else. **Select all** then **Apply** takes that mix in one
+go. To override it, **set to** changes every selected row at once; rows that cannot take the action
+keep their own and say so, so bulk *remove* never deletes a shell history to get at one line of it.
+The confirm names every file that is about to move to the trash rather than only counting secrets.
+
 `undo` restores the most recent batch, moving files back rather than copying them, so a restored secret does not linger in the trash as a second plaintext copy. Batches you do not undo stay until you delete them yourself.
 
 ## What it ignores, and why
