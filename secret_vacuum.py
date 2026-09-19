@@ -659,15 +659,13 @@ class Handler(BaseHTTPRequestHandler):
             failures: list[str] = []
             try:
                 found = scan(self.state["roots"], failures=failures)
-                groups = {g.key: g for g in group_findings(found)}
+                published = _scan_state(found, failures)
             except (RuntimeError, OSError) as e:
                 # scan raises when no root could be read at all, and grouping
                 # shells out to git. Answer with the reason rather than dropping
                 # the connection.
                 return self._json({"error": f"scan failed: {e}", **self.snapshot()}, 503)
-            self.state["groups"] = groups
-            self.state["failures"] = failures
-            self.state["scanned_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.state["scan"] = published
             return self._json(self.snapshot())
         if not self.state["apply"]:
             return self._json({"error": "preview mode: restart with --apply to make changes"}, 403)
@@ -682,7 +680,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "malformed request body"}, 400)
         if route == "/api/apply":
             try:
-                out = apply_actions(self.state["groups"], body.get("actions"))
+                out = apply_actions(self.state["scan"]["groups"], body.get("actions"))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
         elif route == "/api/undo":
@@ -694,28 +692,42 @@ class Handler(BaseHTTPRequestHandler):
         self._json({**out, **self.snapshot()})
 
     def snapshot(self) -> dict:
-        groups = list(self.state["groups"].values())
+        # Read the scan once. Reading groups, failures and the timestamp as three
+        # separate lookups is what lets a rescan land between them.
+        scanned = self.state["scan"]
+        groups = list(scanned["groups"].values())
         return {
             "findings": [g.public() for g in groups],
             "locations": sum(len(g.members) for g in groups),
             "apply": self.state["apply"],
             "roots": [display_path(r) for r in self.state["roots"]],
-            "scanned_at": self.state["scanned_at"],
+            "scanned_at": scanned["at"],
             "gitleaks": self.state["gitleaks"],
             "batches": [b.name for b in batches()],
-            "failures": list(self.state["failures"]),
+            "failures": list(scanned["failures"]),
         }
+
+
+def _scan_state(findings: list[Finding], failures: list[str] | None) -> dict:
+    """Everything a rescan replaces, in one object. Assigning groups, failures and
+    the timestamp separately lets a reader pair one scan's findings with another
+    scan's failure list, and a run whose roots could not be read would then show
+    findings next to an empty failure banner: a clean bill of health for a machine
+    that was never fully scanned."""
+    return {
+        "groups": {g.key: g for g in group_findings(findings)},
+        "failures": list(failures or []),
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
 
 
 def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
           open_browser: bool = True, failures: list[str] | None = None) -> str:
     Handler.state = {
-        "failures": list(failures or []),
-        "groups": {g.key: g for g in group_findings(findings)},
+        "scan": _scan_state(findings, failures),
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
-        "scanned_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "gitleaks": gitleaks_version(),
         "port": 0,
     }

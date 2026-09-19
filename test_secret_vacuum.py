@@ -1077,6 +1077,48 @@ def test_an_unexpected_report_shape_is_a_scan_failure(tmp_path: Path):
         sv.subprocess.run = real_run
 
 
+def test_a_rescan_never_tears_a_snapshot(tmp_path: Path):
+    """snapshot does real work between reading the findings and reading the failure
+    list. Published as separate keys, a rescan lands in that window and the page
+    shows one scan's findings beside another's failures: with the two-lookup shape
+    this tears on roughly half of all snapshots, so a machine with roots that could
+    not be read renders as fully scanned and clean."""
+    sandbox(tmp_path)
+    gens = [
+        sv._scan_state(
+            [finding(str(tmp_path / f"g{g}.env"), FAKE_AWS_ID, line=i) for i in range(1, 300)],
+            [f"gen{g}"],
+        )
+        for g in (0, 1)
+    ]
+
+    class Stub:
+        snapshot = sv.Handler.snapshot
+        state = {"scan": gens[0], "roots": [str(tmp_path)], "apply": False,
+                 "gitleaks": "test", "token": "t", "port": 1}
+
+    stub, stop, torn = Stub(), [False], []
+
+    def flip():
+        i = 0
+        while not stop[0]:
+            stub.state["scan"] = gens[i % 2]
+            i += 1
+
+    writer = threading.Thread(target=flip, daemon=True)
+    writer.start()
+    try:
+        for _ in range(60):
+            snap = stub.snapshot()
+            want = "gen0" if "g0.env" in snap["findings"][0]["paths"][0] else "gen1"
+            if snap["failures"] != [want]:
+                torn.append(snap["failures"])
+    finally:
+        stop[0] = True
+        writer.join()
+    assert not torn, torn[:3]
+
+
 # --------------------------------------------------------------- runner
 
 
