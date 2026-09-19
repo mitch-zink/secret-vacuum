@@ -1048,6 +1048,35 @@ def test_a_filesystem_error_in_a_route_answers_the_request():
     assert "PermissionError" in sent["payload"]["error"], sent
 
 
+def test_an_unexpected_report_shape_is_a_scan_failure(tmp_path: Path):
+    """group_findings indexes the report directly. If a future gitleaks renames a
+    field, that must read as a scan failure, not a KeyError out of the CLI or a
+    request dropped half way through."""
+    sandbox(tmp_path)
+    (tmp_path / "s.env").write_text(f"k = {FAKE_AWS_ID}\n")
+    real_run = subprocess.run
+
+    class Fake:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps([{"Fingerprint": "f", "File": "x", "Description": "d",
+                              "StartLine": 1, "EndLine": 1, "Secret": "s"}])
+
+    def renamed(cmd, **kw):
+        return Fake() if "gitleaks" in cmd[0] and "dir" in cmd else real_run(cmd, **kw)
+
+    sv.subprocess.run = renamed
+    try:
+        detail = ""
+        try:
+            sv.scan([str(tmp_path)])
+        except RuntimeError as e:
+            detail = str(e)
+        assert "missing RuleID" in detail, detail
+    finally:
+        sv.subprocess.run = real_run
+
+
 # --------------------------------------------------------------- runner
 
 

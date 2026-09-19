@@ -255,6 +255,10 @@ def gitleaks_version() -> str:
                           text=True).stdout.strip() or "unknown"
 
 
+# Every field group_findings reads off a report entry. Anything else is optional.
+REPORT_KEYS = ("Fingerprint", "File", "RuleID", "Description", "StartLine", "EndLine", "Secret")
+
+
 def scan_root(root: Path) -> list[dict]:
     """Report goes to stdout, so no file holding secrets is ever created."""
     cmd = [
@@ -285,9 +289,17 @@ def scan_root(root: Path) -> list[dict]:
     if not out:
         return []  # completed, found nothing
     try:
-        return json.loads(out)
-    except ValueError as e:
+        hits = json.loads(out)
+        missing = {k for h in hits for k in REPORT_KEYS if k not in h}
+    except (ValueError, TypeError, AttributeError) as e:
         raise RuntimeError(f"gitleaks returned unreadable output for {root}: {e}") from None
+    if missing:
+        # Checked here, where the report is parsed, so a schema change in some future
+        # gitleaks reads as a scan failure like any other rather than as a KeyError
+        # tracebacking out of the CLI or dropping a request half way through.
+        raise RuntimeError(f"gitleaks report for {root} is missing "
+                           + ", ".join(sorted(missing)))
+    return hits
 
 
 def scan(roots: list[str], progress: bool = False,
