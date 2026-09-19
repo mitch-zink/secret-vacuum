@@ -80,11 +80,12 @@ def test_public_payload_carries_no_secret_value():
 def test_ignore_store_holds_fingerprints_only(tmp_path: Path):
     sandbox(tmp_path)
     f = finding("/tmp/x/.env", FAKE_STRIPE)
-    sv.add_ignore(f.fingerprint)
-    sv.add_ignore(f.fingerprint)  # idempotent
+    sv.add_ignore(f)
+    sv.add_ignore(f)  # idempotent
     body = sv.IGNORE_FILE.read_text()
-    assert body.strip() == f.fingerprint
-    assert FAKE_STRIPE not in body
+    assert body.split() == [f.fingerprint, f"sv:{f.sha8}"], body
+    assert FAKE_STRIPE not in body, "the store never holds a value"
+    assert f.secret[:8] not in body, "not even a prefix of one"
 
 
 def test_manifest_records_paths_not_values(tmp_path: Path):
@@ -975,8 +976,9 @@ def test_ignoring_a_finding_hides_it_from_the_next_scan(tmp_path: Path):
 
     found = sv.scan([str(root)])
     assert found
-    sv.add_ignore(found[0].fingerprint)
-    assert sv.scan([str(root)]) == [], "gitleaks honours our fingerprint ignore file"
+    sv.add_ignore(found[0])
+    assert sv.scan([str(root)]) == [], ("an ignored value must stay gone: the fingerprint "
+                                        "stops gitleaks, the sv: digest stops our parsers")
 
 
 def test_tracked_files_are_flagged_as_committed(tmp_path: Path):
@@ -1198,7 +1200,8 @@ def test_a_context_filter_never_overrules_a_typed_rule(tmp_path: Path):
     akia = finding("/x/terraform.tfstate", FAKE_AWS_ID)
     akia.rule, akia.match = "aws-access-token", url
     signature = finding("/x/terraform.tfstate", "9f2c1a" * 10)
-    signature.rule, signature.match = "generic-api-key", "X-Amz-Signature=" + "9f2c1a" * 10
+    signature.rule = "generic-api-key"
+    signature.match = "X-Amz-" + "Signature=" + "9f2c1a" * 10
 
     kept, dropped = sv.partition([akia, signature])
     assert [f.rule for f in kept] == ["aws-access-token"], "the key id must survive"
@@ -1237,6 +1240,123 @@ def test_the_ui_payload_carries_the_suppression_summary(tmp_path: Path):
     sv.partition(dropped)
     state = sv._scan_state([finding(str(tmp_path / "a.env"), FAKE_STRIPE)], [], dropped)
     assert state["suppressed"] and state["suppressed"][0]["count"] == 1
+
+
+# ----------------------------------------------------- schema parsers
+
+
+def test_terraform_state_secrets_are_found_where_patterns_cannot_see_them(tmp_path: Path):
+    """State holds outputs and attributes in plaintext, frequently base64, which
+    defeats entropy scoring. On a real state file gitleaks reported nothing."""
+    tok = "ZXlKaGJHY2lPaUpJVXpJMU5" + "pSjkuZm9vYmFyYmF6cXV4"
+    doc = {"resources": [{"instances": [{"attributes": {
+        "token": tok * 4,
+        "authentication_mode": "API_AND_CONFIG_MAP",
+        "data": {"AB_JWT_SIGNATURE_SECRET": "c2lnbmluZ3Nl" + "Y3JldHZhbHVlaGVyZQ==",
+                 "instance-admin-password": "Y29ycmVjdGhv" + "cnNlYmF0dGVyeQ=="},  # gitleaks:allow
+        "region": "us-east-1", "bucket": "my-state-bucket"}}]}]}
+    f = tmp_path / "terraform.tfstate"
+    f.write_text(json.dumps(doc, indent=1))
+    found = sv.parse_tfstate(f, f.read_text())
+    names = {x.description.split(" in ")[0] for x in found}
+    assert names == {"token", "AB_JWT_SIGNATURE_SECRET", "instance-admin-password"}, names
+    assert "authentication_mode" not in names, "an enum constant is configuration, not a credential"
+
+
+def test_terraform_state_is_reported_but_never_edited(tmp_path: Path):
+    """A line-level replace leaves the JSON parseable and the state no longer
+    describing reality, so the next apply destroys and recreates. Deleting the file
+    is worse. Report it; the only honest action is rotation."""
+    sandbox(tmp_path)
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(json.dumps({"outputs": {"password": {"value": FAKE_STRIPE}}}))
+    f = finding(str(state), FAKE_STRIPE)
+    assert not f.editable and not f.removable
+    assert f.suggested == "ignore"
+    before = state.read_text()
+    for action in ("remove", "redact"):
+        out = act(action, f)
+        assert not out["results"][0]["ok"]
+        assert "rotate" in out["results"][0]["detail"]
+    assert state.read_text() == before, "state must be untouched by either action"
+
+
+def test_a_redaction_that_breaks_a_structured_file_is_rolled_back(tmp_path: Path):
+    """Redaction is a line-level string replace. Inside a JSON document that can
+    leave something that no longer parses, and a broken kubeconfig is a worse
+    outcome than the redacted line was a good one."""
+    sandbox(tmp_path)
+    target = tmp_path / "app.json"
+    # the value spans the quotes, so replacing it leaves an unterminated string
+    target.write_text('{\n "k": "' + FAKE_STRIPE + '"\n}\n')
+    original = target.read_text()
+    f = finding(str(target), FAKE_STRIPE + '"', line=2)
+    out = act("redact", f)
+    assert target.read_text() == original, "the original must come back"
+    assert not out["results"][0]["ok"]
+    assert "broke the file" in out["results"][0]["detail"], out["results"][0]
+
+
+def test_docker_registry_auth_is_decoded(tmp_path: Path):
+    """auths[].auth is base64 of user:password, not encryption. gitleaks sees one
+    opaque blob."""
+    import base64 as b64
+    blob = b64.b64encode(b"AWS:hunter2hunter2hunter2").decode()
+    f = tmp_path / "config.json"
+    f.write_text(json.dumps({"auths": {"registry.example.com": {"auth": blob}}}))
+    found = sv.parse_docker_config(f, f.read_text())
+    assert len(found) == 1
+    assert found[0].secret == "hunter2hunter2hunter2"
+    assert "registry.example.com" in found[0].description
+
+
+def test_kubeconfig_credentials_are_parsed(tmp_path: Path):
+    f = tmp_path / "config"
+    f.write_text(
+        "apiVersion: v1\nusers:\n- name: admin\n  user:\n"
+        "    token: abcdefghijklmnopqrstuvwxyz012345\n"
+        "- name: certuser\n  user:\n    client-key-data: LS0tLS1CRUdJTiBQUklWQVRF\n")
+    found = sv.parse_kubeconfig(f, f.read_text())
+    kinds = {x.description.split(" for ")[0] for x in found}
+    assert kinds == {"token", "client-key-data"}, kinds
+    assert all(x.detector == "schema" for x in found)
+
+
+def test_container_definitions_with_literal_secrets_are_found(tmp_path: Path):
+    d = tmp_path / "Dockerfile"
+    d.write_text("FROM alpine\nENV API_TOKEN=s3cretvalue0123456789\nENV APP_PORT=8080\n")
+    found = sv.parse_container_env(d, d.read_text())
+    assert [x.description.split(" set ")[0] for x in found] == ["API_TOKEN"]
+
+
+def test_credential_file_assignments_beat_the_keyword_list(tmp_path: Path):
+    """gitleaks' generic rule keys off the variable name, so cs= (a client secret)
+    and setup_token= are invisible. In a .env the file name has already said what
+    the values are -- but a key that announces it is public stays out."""
+    f = tmp_path / ".env"
+    f.write_text(
+        "cid=abcdef0123456789abcdef\n"
+        "cs=sUp3rS3cr3t" + "Cl13ntV4lu3\n"
+        "setup_" + "token=pnu_0123456789abcdefghij\n"  # gitleaks:allow
+        "VITE_SUPABASE_URL=https://xyz.supabase.co\n"
+        "VITE_SUPABASE_ANON_" + "KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\n"  # gitleaks:allow
+        "VITE_TURNSTILE_SITE_KEY=0x4AAAAAAADnPIDROlWd9Tm\n"
+        "APP_NAME=my-application-name\n"
+        "# comment=shouldnotmatch0123456\n")
+    names = {x.description.split(" in ")[0] for x in sv.parse_assignments(f, f.read_text())}
+    assert {"cs", "setup_token"} <= names, f"missed a real credential: {names}"
+    assert not names & {"VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY",
+                        "VITE_TURNSTILE_SITE_KEY", "APP_NAME", "comment"}, names
+
+
+def test_a_parser_that_raises_never_loses_the_scan(tmp_path: Path):
+    """A bug in one parser must not cost the findings from every other file."""
+    bad = tmp_path / "terraform.tfstate"
+    bad.write_text("{ this is not json at all")
+    assert sv.parse_file(bad) == []
+    good = tmp_path / ".env"
+    good.write_text(f"TOKEN={FAKE_STRIPE}\n")
+    assert sv.parse_file(good), "the next file still parses"
 
 
 # --------------------------------------------------------------- runner

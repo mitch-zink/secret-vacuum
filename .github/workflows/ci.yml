@@ -71,4 +71,8 @@ jobs:
       - name: No secrets in the working tree
         run: gitleaks dir . --no-banner --redact
       - name: No secrets anywhere in history
-        run: gitleaks git . --log-opts="--all" --no-banner --redact
+        # The ignore file holds fingerprints of this repo's own test fixtures in
+        # commits already pushed; see the file for why they are not rewritten.
+        run: |
+          gitleaks git . --log-opts="--all" --no-banner --redact \
+            --gitleaks-ignore-path .github/gitleaks-history-ignore

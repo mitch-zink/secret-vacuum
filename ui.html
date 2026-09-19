@@ -56,6 +56,8 @@
   .tag.ok{background:var(--safe-bg);color:var(--safe)}
   .tag.fail{background:var(--danger-bg);color:var(--danger)}
   code{font:12px var(--mono);background:var(--sunk);padding:1px 4px;border-radius:3px}
+  .tag.rotate{background:var(--hazard-bg);color:var(--hazard)}
+  .tag.schema{background:var(--safe-bg);color:var(--safe)}
   .note:not(:empty){font:12px var(--sans);color:var(--soft);margin:0 0 8px}
   select{font:12px var(--sans);padding:4px 6px;border:1px solid var(--rule);border-radius:3px;
     background:var(--surface);color:var(--ink)}
@@ -181,7 +183,9 @@ function render() {
       const r = results[f.key];
       const opts = ["remove", "redact", "ignore"]
         .map((a) => {
-          const off = a === "remove" && !f.removable;
+          // Nothing editable about terraform state: a line replace leaves valid
+          // JSON that no longer describes reality, and deleting it is worse.
+          const off = (a === "remove" && !f.removable) || (a !== "ignore" && f.editable === false);
           const sel = a === f.suggested ? " selected" : "";
           return `<option value="${a}"${sel}${off ? " disabled" : ""}>${a}</option>`;
         })
@@ -198,7 +202,9 @@ function render() {
         <td class="rule">${esc(f.rule)}</td>
         <td class="num val">${f.copies}</td>
         <td>${f.tracked ? '<span class="tag committed">committed</span>' : ""}
-            ${!f.removable ? '<span class="tag">history</span>' : ""}</td>
+            ${f.editable === false ? '<span class="tag rotate">rotate only</span>'
+              : !f.removable ? '<span class="tag">history</span>' : ""}
+            ${f.detector === "schema" ? '<span class="tag schema">parsed</span>' : ""}</td>
         <td><select class="act" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}>${opts}</select></td>
         <td>${r ? `<span class="tag ${r.ok ? "ok" : "fail"}">${esc(r.detail)}</span>` : ""}</td>
       </tr>`;

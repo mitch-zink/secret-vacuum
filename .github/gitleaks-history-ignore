@@ -1,0 +1,10 @@
+# Fingerprints from this repository's own history, not credentials.
+#
+# Every entry is a fabricated test fixture that proves a scanner works. The
+# working tree marks them with "gitleaks:allow"; a commit made before the marker
+# was added still carries the unmarked line, and rewriting published history to
+# tidy a test fixture is not a trade worth making.
+#
+# Deliberately not named .gitleaksignore: that name is gitignored so a user's own
+# runtime ignore file can never be committed by accident.
+91b6558627c3f45c902d93f2519bb1c2fd8f5b0d:test_secret_vacuum.py:generic-api-key:1201

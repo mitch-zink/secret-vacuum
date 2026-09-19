@@ -14,6 +14,7 @@ Four guarantees, each covered by a test in test_secret_vacuum.py:
 from __future__ import annotations
 
 import argparse
+import base64
 import functools
 import hashlib
 import hmac
@@ -108,6 +109,18 @@ REDACT_ONLY = frozenset({
 })
 
 ACTIONS = ("remove", "redact", "ignore")
+
+# Editing these corrupts something. Terraform state is the clear case: the JSON
+# stays parseable after a line-level replace but no longer describes reality, and
+# the next apply destroys and recreates. Deleting the file is worse. So they are
+# reported, and the only honest action is to rotate the credential upstream.
+ROTATE_ONLY = re.compile(r"\.tfstate(\.backup)?$", re.IGNORECASE)
+
+# Formats where a successful write still has to produce a parseable document.
+STRUCTURED = {
+    ".json": json.loads,
+    ".tfstate": json.loads,
+}
 
 
 @dataclass(frozen=True)
@@ -221,6 +234,10 @@ class Finding:
     entropy: float
     secret: str = field(repr=False)
     match: str = field(default="", repr=False)
+    # "pattern" (gitleaks matched a regex) or "schema" (we parsed the format and
+    # read a field that is a credential by definition). Different trust, so the
+    # UI ranks on it and can hide one.
+    detector: str = "pattern"
     tracked: bool = False
     suppressed_by: str = ""
     suppressed_why: str = ""
@@ -241,11 +258,18 @@ class Finding:
     def suggested(self) -> str:
         """Pre-selected action. Never destructive by surprise: whole-file removal is
         only the default for files that are nothing but credential."""
+        if not self.editable:
+            return "ignore"
         return "remove" if self.removable and CREDENTIAL_FILES.match(base_name(self.path)) else "redact"
 
     @property
     def removable(self) -> bool:
-        return base_name(self.path) not in REDACT_ONLY
+        return base_name(self.path) not in REDACT_ONLY and self.editable
+
+    @property
+    def editable(self) -> bool:
+        """False where any edit is worse than the leak it removes."""
+        return not ROTATE_ONLY.search(base_name(self.path))
 
     def public(self) -> dict:
         return {
@@ -262,7 +286,9 @@ class Finding:
             "length": len(self.secret),
             "tracked": self.tracked,
             "removable": self.removable,
+            "editable": self.editable,
             "suggested": self.suggested,
+            "detector": self.detector,
         }
 
 
@@ -288,6 +314,10 @@ class Group:
         return all(m.removable for m in self.members)
 
     @property
+    def editable(self) -> bool:
+        return all(m.editable for m in self.members)
+
+    @property
     def suggested(self) -> str:
         return "remove" if all(m.suggested == "remove" for m in self.members) else "redact"
 
@@ -308,7 +338,9 @@ class Group:
             "tracked": self.tracked,
             "tracked_copies": sum(m.tracked for m in self.members),
             "removable": self.removable,
+            "editable": self.editable,
             "suggested": self.suggested,
+            "detector": "schema" if any(m.detector == "schema" for m in self.members) else "pattern",
         }
 
 
@@ -463,6 +495,20 @@ def scan(roots: list[str], progress: bool = False,
         )
         found.setdefault(f.fingerprint, f)
 
+    # Schema parsers walk the same roots: a file gitleaks found nothing in can
+    # still be a kubeconfig full of credentials. Where both detectors see the same
+    # value in the same file, gitleaks' entry wins -- it carries the real line
+    # number, which is what redaction edits.
+    seen = {(f.path, f.digest) for f in found.values()}
+    skip = ignored_fingerprints()
+    for f in parse_roots(paths):
+        if f.fingerprint in skip or f"sv:{f.sha8}" in skip:
+            continue
+        if (f.path, f.digest) not in seen:
+            seen.add((f.path, f.digest))
+            found.setdefault(f.fingerprint, f)
+
+    found = {k: f for k, f in found.items() if f"sv:{f.sha8}" not in skip}
     kept, dropped = partition(list(found.values()))
     suppressed.extend(dropped)
     if progress and dropped:
@@ -472,6 +518,262 @@ def scan(roots: list[str], progress: bool = False,
     for f in kept:
         f.tracked = git_tracked(f.path)
     return sorted(kept, key=lambda f: (not f.tracked, f.path, f.start_line))
+
+
+# --------------------------------------------------------------------------- schema parsers
+#
+# gitleaks matches patterns against lines. That misses two whole categories: a
+# value whose variable name is not in its keyword list (cs=, setup_token=), and a
+# value inside a format where the field name already tells you it is a
+# credential. Parsing the format has no false positives to trade away -- a
+# kubeconfig client-key-data IS a private key -- so these run beside gitleaks
+# rather than instead of it, and carry detector="schema" so the UI can rank them
+# above a pattern match.
+
+# Names that are public by definition. Validated against a real corpus before it
+# shipped: on 15 .env files it keeps 14 candidates and drops 27, and the dropped
+# set is exactly URLs, anon keys, site keys, ids and display names.
+PUBLIC_NAME = re.compile(
+    # suffixes: what the value IS
+    r"(_URL|_URI|_HOST|_PORT|_ID|_NAME|_REGION|_BUCKET|_EMAIL|_USER|_ENV|_PATH|_DIR"
+    r"|_VERSION|_MODEL|CLIENT_ID)$"
+    # anywhere: a key that says on its face it is meant to be published. Anchoring
+    # these too let VITE_SUPABASE_ANON_KEY through, because it ends in _KEY.
+    r"|(PUBLIC|ANON|SITE_KEY|PUBLISHABLE)", re.IGNORECASE)
+PUBLIC_VALUE = re.compile(r"^(https?://|/|\./|\d+$|true$|false$|<|\$\{|~/)", re.IGNORECASE)
+ASSIGN = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.\-]*)\s*[=:]\s*(.+?)\s*$")
+
+# Field names that are a credential wherever they appear in a structured document.
+SECRET_FIELD = re.compile(
+    r"(password|passwd|secret|token|private[-_]?key|client[-_]?secret|access[-_]?key"
+    r"|credential|api[-_]?key|session|(^|[-_])auth([-_]|$))", re.IGNORECASE)
+
+# Names that contain a secret-ish word and are public by definition. A cluster's
+# certificate_authority matched "auth"; a CA certificate is meant to be handed out.
+NOT_SECRET_FIELD = re.compile(
+    r"(certificate_authority|ca_cert|authority_data|auth_provider|authentication_mode"
+    r"|token_endpoint|token_uri|auth_url|auth_uri|public_key|_fingerprint)", re.IGNORECASE)
+
+ENV_FILES = re.compile(r"^(\.env.*|.+\.env|\.npmrc|\.pypirc|\.netrc|_netrc|credentials"
+                       r"|connections\.toml|\.pgpass|\.aider\.conf\.yml|\.envrc)$", re.IGNORECASE)
+
+
+# An enum constant reads like a secret field's value but is one of a fixed set:
+# authentication_mode = API_AND_CONFIG_MAP is configuration, not a credential.
+ENUMISH = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _secret_shaped(value: str) -> bool:
+    return (len(value) >= 8 and " " not in value and not ENUMISH.match(value)
+            and not value.startswith(("arn:", "http://", "https://", "/", "{", "[")))
+
+
+def _plausible(name: str, value: str) -> bool:
+    value = value.strip().strip('"').strip("'")
+    return (len(value) >= 8 and not PUBLIC_NAME.search(name)
+            and not PUBLIC_VALUE.match(value) and " " not in value)
+
+
+def _mk(path: str, line: int, rule: str, desc: str, value: str) -> Finding:
+    return Finding(
+        fingerprint=f"{path}:{rule}:{line}:{hashlib.sha256(value.encode()).hexdigest()[:8]}",
+        path=path, rule=rule, description=desc, start_line=line, end_line=line,
+        entropy=0.0, secret=value, match=f"{rule} at line {line}", detector="schema")
+
+
+def parse_assignments(path: Path, text: str) -> list[Finding]:
+    """Every assignment in a file whose whole purpose is credentials. gitleaks'
+    generic rule keys off the variable name, so cs= and setup_token= are invisible
+    to it; in a .env the file name has already told us what the values are."""
+    out = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith(("#", ";")):
+            continue
+        m = ASSIGN.match(line)
+        if m and _plausible(m.group(1), m.group(2)):
+            out.append(_mk(str(path), i, "credential-file-assignment",
+                           f"{m.group(1)} in a file that exists to hold credentials",
+                           m.group(2).strip().strip('"').strip("'")))
+    return out
+
+
+def _walk_json(node: object, path: list[str]):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _walk_json(v, path + [str(k)])
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from _walk_json(v, path + [f"[{i}]"])
+    else:
+        yield ".".join(path), node
+
+
+# Wrappers that carry no meaning of their own: the name of an output is the key
+# above its "value", not the word "value".
+WRAPPER_KEYS = frozenset({"value", "attributes", "data", "instances", "resources",
+                          "outputs", "root_module", "values", "primary"})
+
+
+def _is_secret_field(name: str) -> bool:
+    return bool(SECRET_FIELD.search(name)) and not NOT_SECRET_FIELD.search(name)
+
+
+def _leaf_name(where: str) -> str:
+    for part in reversed(where.split(".")):
+        if part and not part.startswith("[") and part not in WRAPPER_KEYS:
+            return part
+    return ""
+
+
+def parse_tfstate(path: Path, text: str) -> list[Finding]:
+    """Terraform writes outputs and resource attributes to state in plaintext; the
+    `sensitive` flag hides them from CLI output and does not encrypt them. Values
+    are frequently base64, which defeats entropy scoring entirely."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return []
+    out, seen = [], set()
+
+    def add(name: str, value: str, why: str):
+        if _secret_shaped(value) and (name, value) not in seen:
+            seen.add((name, value))
+            out.append(_mk(str(path), 1, "tfstate-attribute",
+                           f"{name} in terraform state, {why}", value))
+
+    # Terraform's own signal, which needs no name heuristic at all.
+    for name, spec in (doc.get("outputs") or {}).items():
+        if isinstance(spec, dict) and spec.get("sensitive") and isinstance(spec.get("value"), str):
+            add(name, spec["value"], "an output marked sensitive and stored in plaintext")
+
+    for where, value in _walk_json(doc, []):
+        name = _leaf_name(where)
+        if isinstance(value, str) and _is_secret_field(name):
+            add(name, value, "stored in plaintext")
+    return out
+
+
+def parse_docker_config(path: Path, text: str) -> list[Finding]:
+    """auths[].auth is base64 of user:password. Not encryption, and gitleaks sees
+    one opaque blob."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return []
+    out = []
+    for registry, entry in (doc.get("auths") or {}).items():
+        blob = (entry or {}).get("auth")
+        if not blob:
+            continue
+        try:
+            decoded = base64.b64decode(blob + "==").decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - malformed base64 is just not a credential
+            continue
+        if ":" in decoded:
+            out.append(_mk(str(path), 1, "docker-registry-auth",
+                           f"base64 user:password for {registry}", decoded.split(":", 1)[1]))
+    return out
+
+
+def parse_kubeconfig(path: Path, text: str) -> list[Finding]:
+    """token, password and client-key-data live under users[].user. Parsed rather
+    than pattern-matched because removing one has to take its contexts with it."""
+    out = []
+    user, name = None, ""
+    for i, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("- name:"):
+            name = stripped.split(":", 1)[1].strip()
+        m = re.match(r"^\s*(token|password|client-key-data|id-token|refresh-token):\s*(\S+)", line)
+        if m and len(m.group(2)) >= 8:
+            out.append(_mk(str(path), i, "kubeconfig-credential",
+                           f"{m.group(1)} for user {name or '?'}", m.group(2)))
+    del user
+    return out
+
+
+def parse_container_env(path: Path, text: str) -> list[Finding]:
+    """ENV and ARG in a Dockerfile, environment: in a compose file. A literal here
+    is baked into an image or a repo."""
+    out = []
+    for i, line in enumerate(text.splitlines(), 1):
+        m = re.match(r"^\s*(?:ENV|ARG)\s+([A-Za-z_][\w]*)\s*=\s*(\S+)", line) \
+            or re.match(r"^\s*-?\s*([A-Z_][A-Z0-9_]{3,})\s*[:=]\s*(\S+)\s*$", line)
+        if m and _plausible(m.group(1), m.group(2)):
+            out.append(_mk(str(path), i, "container-env",
+                           f"{m.group(1)} set literally in a container definition",
+                           m.group(2).strip().strip('"').strip("'")))
+    return out
+
+
+# name-or-suffix -> parser. Checked against the file name, cheapest test first.
+PARSERS: list[tuple[re.Pattern, object]] = [
+    (re.compile(r"\.tfstate(\.backup)?$", re.I), parse_tfstate),
+    (re.compile(r"^config\.json$"), parse_docker_config),
+    (re.compile(r"^(config|kubeconfig)(\.ya?ml)?$", re.I), parse_kubeconfig),
+    (re.compile(r"^(docker-)?compose.*\.ya?ml$|^Dockerfile", re.I), parse_container_env),
+    (ENV_FILES, parse_assignments),
+]
+MAX_PARSE_BYTES = 8 << 20
+
+
+def parse_file(path: Path) -> list[Finding]:
+    """Run whichever parsers claim this file name. A parser that raises is a bug in
+    us, never a reason to lose the rest of the scan."""
+    name = base_name(str(path))
+    claims = [fn for rx, fn in PARSERS if rx.search(name)]
+    if not claims:
+        return []
+    try:
+        if path.stat().st_size > MAX_PARSE_BYTES:
+            return []
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[Finding] = []
+    for fn in claims:
+        try:
+            out += fn(path, text)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def ignored_fingerprints() -> set[str]:
+    """gitleaks applies .gitleaksignore to its own findings. The schema parsers are
+    ours, so the Ignore action has to reach them here or an ignored value comes
+    straight back on the next scan."""
+    if not IGNORE_FILE.exists():
+        return set()
+    try:
+        lines = IGNORE_FILE.read_text().splitlines()
+    except OSError:
+        return set()
+    return {ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")}
+
+
+def parse_roots(roots: list[Path]) -> list[Finding]:
+    """One metadata walk, pruned by the same deny-list gitleaks uses."""
+    out: list[Finding] = []
+    for root in roots:
+        if root.is_file():
+            out += parse_file(root)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
+            dirnames[:] = [d for d in dirnames
+                           if not any(f"{dirpath}/{d}".endswith(x) or d == x.split("/")[-1]
+                                      for x in DENY)
+                           and d not in SKIP_DIRS]
+            for fn in filenames:
+                out += parse_file(Path(dirpath) / fn)
+    return out
+
+
+SKIP_DIRS = frozenset({
+    "node_modules", ".venv", "venv", "site-packages", "__pycache__", ".git",
+    ".terraform", "dist", "build", "target", ".next", ".cache", "Caches",
+    "vendor", "Pods", "dbt_packages", ".mypy_cache", ".pytest_cache", ".Trash",
+})
 
 
 # --------------------------------------------------------------------------- actions
@@ -523,6 +825,18 @@ def _stash(batch: Path, src: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     return dest
+
+
+def _parse_error(path: Path) -> str:
+    """Empty string when the file still parses as whatever its extension claims."""
+    parser = STRUCTURED.get(PurePath(base_name(str(path))).suffix.lower())
+    if not parser:
+        return ""
+    try:
+        parser(path.read_text(encoding="utf-8", errors="surrogateescape"))
+    except (ValueError, OSError) as e:
+        return str(e)[:80]
+    return ""
 
 
 def redact_lines(lines: list[str], f: Finding) -> tuple[list[str], bool]:
@@ -590,8 +904,14 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
 
     # Redact first: a file also queued for removal is skipped, not double-handled.
     by_file: dict[str, list[Finding]] = {}
+    blocked = [(f, a) for f, a in chosen if a != "ignore" and not f.editable]
+    results += [{"fingerprint": f.fingerprint, "ok": False,
+                 "detail": "terraform state: rotate the credential, editing state corrupts it"}
+                for f, _ in blocked]
+    stop = {f.fingerprint for f, _ in blocked}
+
     for f, a in chosen:
-        if a == "redact" and f.path not in remove:
+        if a == "redact" and f.path not in remove and f.fingerprint not in stop:
             by_file.setdefault(f.path, []).append(f)
 
     for path, group in by_file.items():
@@ -615,11 +935,21 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
         # would leave an orphaned copy of the secret in the trash and bump the
         # mtime of a file we did not edit. The original is still on disk here.
         if changed:
-            _stash(batch, src)
+            stashed = _stash(batch, src)
             src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
+            # A line-level replace inside a structured document can leave it
+            # unparseable. Check, and put the original back rather than hand the
+            # user a broken kubeconfig in exchange for a redacted line.
+            broke = _parse_error(src)
+            if broke:
+                shutil.copy2(stashed, src)
+                for r in results[-len(group):]:
+                    r["ok"], r["detail"] = False, f"left alone: editing it broke the file ({broke})"
 
     moved: set[str] = set()
     for f, a in chosen:
+        if f.fingerprint in stop:
+            continue
         if a == "remove":
             if not f.removable:
                 results.append({"fingerprint": f.fingerprint, "ok": False,
@@ -637,13 +967,13 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
                 entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
                 results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
         elif a == "ignore":
-            add_ignore(f.fingerprint)
+            add_ignore(f)
             results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
 
     # A redaction on a file that was also removed never ran, but the value went with
     # the file. Say so, rather than leaving that row with no outcome at all.
     for f, a in chosen:
-        if a == "redact" and f.path in remove:
+        if a == "redact" and f.path in remove and f.fingerprint not in stop:
             gone = f.path in moved
             results.append({
                 "fingerprint": f.fingerprint, "ok": gone,
@@ -678,13 +1008,21 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
     return {"batch": batch.name if batch else None, "results": results}
 
 
-def add_ignore(fingerprint: str) -> None:
-    """gitleaks' own ignore format: fingerprints, never values."""
+def add_ignore(f: Finding) -> None:
+    """gitleaks' own ignore format: fingerprints, never values.
+
+    Two lines, because there are two detectors. The fingerprint is what gitleaks
+    itself honours. The `sv:` line is a SHA-256 prefix of the value, which is how
+    the schema parsers honour it -- without it, ignoring the gitleaks hit simply
+    let our own finding for the same value take its place on the next scan. It
+    also matches what the UI says the button does: the row is a value, and the
+    action applies to every copy. gitleaks ignores a line it cannot parse."""
     IGNORE_FILE.parent.mkdir(parents=True, exist_ok=True)
     current = IGNORE_FILE.read_text().splitlines() if IGNORE_FILE.exists() else []
-    if fingerprint not in current:
-        with IGNORE_FILE.open("a") as fh:
-            fh.write(fingerprint + "\n")
+    with IGNORE_FILE.open("a") as fh:
+        for line in (f.fingerprint, f"sv:{f.sha8}"):
+            if line not in current:
+                fh.write(line + "\n")
 
 
 def batches() -> list[Path]:
