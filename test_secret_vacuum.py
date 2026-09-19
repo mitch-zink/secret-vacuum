@@ -95,9 +95,12 @@ def test_manifest_records_paths_not_values(tmp_path: Path):
     target.write_text(f"token={FAKE_STRIPE}\n")
     f = finding(str(target), FAKE_STRIPE)
     act("remove", f)
-    manifest = next(sv.TRASH.rglob("manifest.json")).read_text()
-    assert FAKE_STRIPE not in manifest
-    assert str(target) in manifest
+    raw = next(sv.TRASH.rglob("manifest.json")).read_text()
+    assert FAKE_STRIPE not in raw
+    # compared as data, not as JSON text: a Windows path is backslash-escaped in
+    # the encoding and would never match the literal
+    entries = json.loads(raw)["entries"]
+    assert [Path(e["path"]) for e in entries] == [target]
 
 
 # --------------------------------------------------------------- guarantee 2: move, never unlink
@@ -114,7 +117,7 @@ def test_remove_moves_to_trash_and_undo_restores_byte_identical(tmp_path: Path):
     out = act("remove", f)
 
     assert out["results"][0]["ok"] and not target.exists()
-    stashed = sv.TRASH / out["batch"] / "files" / str(target).lstrip("/")
+    stashed = sv.TRASH / out["batch"] / "files" / sv.trash_rel(target)
     assert stashed.read_text() == original, "the file must survive intact in the trash"
 
     assert sv.undo()["ok"]
@@ -1561,6 +1564,24 @@ def test_both_detectors_skip_exactly_the_same_trees(tmp_path: Path):
 def test_the_skip_list_covers_windows_separators(tmp_path: Path):
     assert sv.is_skipped(r"C:\Users\dev\project\node_modules\pkg\.env")
     assert not sv.is_skipped(r"C:\Users\dev\project\.env")
+
+
+def test_the_two_detectors_agree_on_what_one_file_is_called(tmp_path: Path):
+    """gitleaks reports forward slashes and os.walk reports the host separator. On
+    Windows the same file therefore arrived under two names, the (path, digest)
+    dedupe never matched, and every finding in a parseable file was counted twice."""
+    sandbox(tmp_path)
+    env = tmp_path / "svc" / ".env"
+    env.parent.mkdir()
+    env.write_text(f"STRIPE_KEY={FAKE_STRIPE}\n")
+
+    found = sv.scan([str(tmp_path)])
+    hits = [f for f in found if f.secret == FAKE_STRIPE]
+    assert len(hits) == 1, [f"{f.detector}:{f.path}" for f in hits]
+    assert sv.group_findings(found)[0].public()["copies"] == 1
+
+    mixed = str(env).replace("\\", "/")
+    assert sv.norm_path(mixed) == sv.norm_path(str(env))
 
 
 # --------------------------------------------------------------- runner

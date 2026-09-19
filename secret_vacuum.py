@@ -93,6 +93,15 @@ def default_roots() -> list[str]:
 
 # Rewriting shell history is its own kind of damage, so history files are
 # shown and redactable but never removable as a whole file.
+def norm_path(path: str) -> str:
+    """One spelling per file, whichever detector found it.
+
+    gitleaks reports forward slashes and os.walk reports the host separator, so on
+    Windows the same file arrived under two names, the (path, digest) dedupe never
+    matched, and every finding in a parseable file was reported twice."""
+    return os.path.normpath(str(path))
+
+
 def base_name(path: str) -> str:
     """Final component, splitting on both separators. PurePath would use only the
     host's separator, so a Windows path inspected on POSIX is one long filename and
@@ -502,7 +511,7 @@ def scan(roots: list[str], progress: bool = False,
 
     found: dict[str, Finding] = {}
     for h in raw:
-        path = h.get("SymlinkFile") or h["File"]
+        path = norm_path(h.get("SymlinkFile") or h["File"])
         f = Finding(
             fingerprint=h["Fingerprint"],
             path=path,
@@ -596,6 +605,7 @@ def _plausible(name: str, value: str) -> bool:
 
 
 def _mk(path: str, line: int, rule: str, desc: str, value: str) -> Finding:
+    path = norm_path(path)
     return Finding(
         fingerprint=f"{path}:{rule}:{line}:{hashlib.sha256(value.encode()).hexdigest()[:8]}",
         path=path, rule=rule, description=desc, start_line=line, end_line=line,
