@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import base64
 import json
 import shutil
 import subprocess
@@ -30,11 +31,13 @@ FAKE_AWS_SECRET = "hT8vQm2NxL9pRzK4" + "wYcE7bJfA1sD6gU3nV0iZoXq"  # gitleaks:al
 FAKE_STRIPE = "sk_" + "live_" + "4eC39HqLyjWDarjtT1zdp7dc"  # gitleaks:allow
 
 
-def finding(path: str, secret: str, line: int = 1, end: int | None = None) -> sv.Finding:
+def finding(path: str, secret: str, line: int = 1, end: int | None = None,
+            rule: str = "test-rule", match: str = "") -> sv.Finding:
     return sv.Finding(
-        fingerprint=f"{path}:test-rule:{line}",
+        fingerprint=f"{path}:{rule}:{line}",
         path=path,
-        rule="test-rule",
+        rule=rule,
+        match=match,
         description="a test rule",
         start_line=line,
         end_line=end or line,
@@ -1607,3 +1610,44 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _jwt(**claims) -> str:
+    # built at runtime so this file does not trip its own scanner
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return ".".join([enc({"alg": "HS256", "typ": "JWT"}), enc(claims), "c2lnbmF0dXJlLXZhbHVl"])
+
+
+def test_findings_nobody_could_use_are_suppressed_and_named(tmp_path: Path):
+    """Reviewing a real scan, half the list could not be used by anyone who stole
+    it: expired tokens, Supabase's public anon key, git SHAs matched by a token
+    rule, request ids. Each is dropped with a named reason, never silently."""
+    far, past = 4102444800, 1600000000
+    cache = tmp_path / "cache.json"
+    cache.write_text('{"path":"p","reviewed_commit":"' + "0123abcd" * 5 + '"}\n')
+    cases = {
+        "expired-jwt": finding("/x/auth.json", _jwt(exp=past)),
+        "public-jwt": finding("/x/app.env", _jwt(role="anon", exp=far)),
+        "public-env": finding("/x/.env", "pk" + "abcdef0123456789xyz", rule="generic-api-key",
+                              match="VITE_SUPABASE_ANON_KEY=x"),
+        "git-sha": finding(str(cache), "0123abcd" * 5, rule="sourcegraph-access-token"),
+        "not-a-credential": finding("/x/log", "Zm9vYmFyYmF6cXV4", rule="generic-api-key",
+                                    match="'apigw-requestid': 'Zm9vYmFyYmF6cXV4'"),
+        "publishable-key": finding("/x/.env", "sb_publishable_" + "abcdef0123456789"),
+        "example-file": finding("/x/.env.example", "acct" + "12345678", rule="generic-api-key"),
+    }
+    kept, dropped = sv.partition(list(cases.values()))
+    assert not kept, [f.path for f in kept]
+    assert {f.suppressed_by for f in dropped} == set(cases)
+
+
+def test_a_jwt_that_still_grants_access_is_kept(tmp_path: Path):
+    """A Supabase service_role key is a JWT too, and the most dangerous thing in
+    the repo. Being a JWT is never the reason to drop one."""
+    svc = finding("/x/.env", _jwt(role="service_role", iss="supabase", exp=4102444800))
+    noexp = finding("/x/.env", _jwt(role="USER", scope="MCP"))
+    notes = tmp_path / "notes"
+    notes.write_text("token: " + "0123abcd" * 5 + "\n")
+    sha_in_prose = finding(str(notes), "0123abcd" * 5, rule="sourcegraph-access-token")
+    kept, _ = sv.partition([svc, noexp, sha_in_prose])
+    assert kept == [svc, noexp, sha_in_prose]

@@ -28,6 +28,7 @@ import sys
 import threading
 import webbrowser
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -148,13 +149,16 @@ class Suppressor:
 
     name: str
     reason: str
-    pattern: re.Pattern
+    pattern: re.Pattern | None = None
     target: str = "secret"  # "secret" or "match" (the surrounding text gitleaks matched)
     generic_only: bool = False
+    check: Callable[[Finding], bool] | None = None  # for what a regex cannot see
 
     def hides(self, f: Finding) -> bool:
         if self.generic_only and "generic" not in f.rule:
             return False
+        if self.check:
+            return self.check(f)
         return bool(self.pattern.search(f.secret if self.target == "secret" else f.match))
 
 
@@ -178,7 +182,45 @@ SUPPRESSORS = [
     Suppressor("presigned-url", "an expiring S3 signature, not a stored credential",
                re.compile(r"X-Amz-(Signature|Credential)="), target="match",
                generic_only=True),
+    # A JWT is judged by what it grants, not by being a JWT. Expired ones grant
+    # nothing; anon-role ones (Supabase's client key) ship to every browser. A
+    # service_role key is also a JWT, unexpired and not anon, so it stays.
+    Suppressor("expired-jwt", "an expired token grants nothing",
+               check=lambda f: offline_check(f.secret)[0] == "expired"),
+    Suppressor("public-jwt", "a client-side key (role anon), public by design",
+               check=lambda f: (jwt_claims(f.secret) or {}).get("role") == "anon"),
+    Suppressor("publishable-key", "a publishable key, meant to ship in client code",
+               re.compile(r"^(sb_publishable_|pk_(live|test)_)")),
+    Suppressor("public-env", "a build-time public variable, shipped to every browser",
+               re.compile(r"(?i)\b(VITE|NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|GATSBY)_\w*\s*[=:]"),
+               target="match", generic_only=True),
+    # Typed rules too: sourcegraph's legacy token is bare 40-hex, so every git SHA
+    # in a JSON cache matched it. gitleaks' match stops at the value, so the key
+    # name is read off the line itself.
+    Suppressor("git-sha", "a commit hash, not a credential", check=lambda f:
+               bool(re.fullmatch(r"[0-9a-f]{40}", f.secret)) and bool(re.search(
+                   r"(?i)(sha|commit|revision|rev|hash|checksum)\w*[\"']?\s*[:=]\s*[\"']?$",
+                   line_before(f)))),
+    Suppressor("not-a-credential", "a request id, page cursor or token prefix", re.compile(
+        r"(?i)(request[-_]?id|page[-_]?token|next[-_]?token|cursor|etag|correlation[-_]?id"
+        r"|trace[-_]?id|token[ _]prefix)[\"']?\s*[:=]"), target="match", generic_only=True),
+    Suppressor("example-file", "a template file, its values are samples",
+               check=lambda f: ("generic" in f.rule or f.rule == "credential-file-assignment")
+               and bool(re.search(r"(?i)\.(example|sample|template|dist)$", base_name(f.path)))),
 ]
+
+
+def line_before(f: Finding, width: int = 60) -> str:
+    """The text just before the value on its line, which gitleaks' match omits."""
+    try:
+        with open(f.path, encoding="utf-8", errors="replace") as fh:
+            for n, line in enumerate(fh, 1):
+                if n == f.start_line:
+                    at = line.find(f.secret)
+                    return line[max(0, at - width):at] if at >= 0 else ""
+    except OSError:
+        pass
+    return ""
 
 
 def partition(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
@@ -843,6 +885,18 @@ AWS_ID_RE = re.compile(r"^(AKIA|ASIA|AIDA|AROA|AGPA|ANPA|ANVA|APKA)[A-Z2-7]{16}$
 
 def _b64pad(chunk: str) -> bytes:
     return base64.urlsafe_b64decode(chunk + "=" * (-len(chunk) % 4))
+
+
+def jwt_claims(value: str) -> dict | None:
+    """The payload of a JWT, or None if the value is not one."""
+    v = value.strip()
+    if not JWT_RE.match(v):
+        return None
+    try:
+        claims = json.loads(_b64pad(v.split(".")[1]))
+    except Exception:  # noqa: BLE001
+        return None
+    return claims if isinstance(claims, dict) else None
 
 
 def offline_check(value: str) -> tuple[str, str]:

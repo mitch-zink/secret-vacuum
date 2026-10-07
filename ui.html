@@ -68,6 +68,26 @@
     padding:11px 14px;margin:14px 0;font-size:13px}
   .empty{padding:60px 0;text-align:center;color:var(--faint)}
   footer{padding:14px 20px;color:var(--faint);font:11.5px var(--mono);border-top:1px solid var(--rule)}
+  .dash{display:grid;gap:14px;margin:16px 0 6px}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+  .tile{background:var(--surface);border:1px solid var(--rule);border-radius:4px;padding:11px 13px}
+  .tile b{display:block;font:600 22px/1.15 var(--sans);font-variant-numeric:tabular-nums}
+  .tile span{font:10.5px var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--faint)}
+  .tile small{display:block;font-size:11.5px;color:var(--soft);margin-top:2px}
+  .tile.hazard b{color:var(--hazard)} .tile.danger b{color:var(--danger)} .tile.safe b{color:var(--safe)}
+  .tile.zero b{color:var(--faint)}
+  button.tile{text-align:left;font:inherit;cursor:pointer}
+  .bars{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+  .bars section{background:var(--surface);border:1px solid var(--rule);border-radius:4px;padding:11px 13px}
+  .bars h2{font:10.5px var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--faint);margin:0 0 8px}
+  .bar-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;width:100%;padding:4px 0;
+    border:0;background:none;text-align:left;cursor:pointer;font:12px var(--mono);color:var(--ink)}
+  .bar-row:hover .lbl,.bar-row.on .lbl{text-decoration:underline}
+  .bar-row .lbl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bar-row .n{color:var(--soft);font-variant-numeric:tabular-nums}
+  .bar-row i{grid-column:1/-1;height:4px;border-radius:2px;background:var(--sunk);display:block}
+  .bar-row i::after{content:"";display:block;height:100%;width:var(--w);border-radius:2px;background:var(--soft)}
+  .bar-row.typed i::after{background:var(--danger)}
   @media (max-width:640px){th.hide,td.hide{display:none}}
 </style>
 </head>
@@ -97,6 +117,11 @@
 </div>
 
 <div class="wrap">
+  <div class="dash" id="dash" hidden>
+    <div class="tiles" id="tiles"></div>
+    <div class="bars"><section><h2>By type</h2><div id="byRule"></div></section>
+      <section><h2>Where they live</h2><div id="byArea"></div></section></div>
+  </div>
   <div id="banner"></div>
   <div id="note" class="note"></div>
   <div class="tbl-scroll">
@@ -141,7 +166,53 @@ function visible() {
   );
 }
 
+// Bucket a location by the folder a person would recognise: two levels under
+// home, three under the OS app-storage dirs where the app name is the third.
+function area(p) {
+  const parts = p.replace(/:\d+$/, "").replace(/^~[\\/]/, "").split(/[\\/]/).slice(0, -1);
+  const deep = /^(Library|AppData)$/.test(parts[0]) ? 3 : 2;
+  return parts.length ? "~/" + parts.slice(0, deep).join("/") : "~";
+}
+
+const topN = (counter, n = 8) => [...counter].sort((a, b) => b[1] - a[1]).slice(0, n);
+
+function bars(el, rows, cls = () => "") {
+  const max = rows[0]?.[1] || 1, q = $("filter").value.trim().toLowerCase();
+  $(el).innerHTML = rows.map(([k, n]) =>
+    `<button class="bar-row ${cls(k)} ${q && q === k.toLowerCase() ? "on" : ""}" data-q="${esc(k)}" title="filter to ${esc(k)}">
+      <span class="lbl">${esc(k)}</span><span class="n">${n}</span>
+      <i style="--w:${Math.max(2, (100 * n) / max)}%"></i></button>`).join("");
+}
+
+function dashboard() {
+  const fs = state.findings, sup = (state.suppressed || []).reduce((t, r) => t + r.count, 0);
+  $("dash").hidden = !fs.length && !sup;
+  const count = (pred) => fs.filter(pred).length;
+  const generic = count((f) => f.rule.includes("generic"));
+  const done = Object.values(results).filter((r) => r.ok).length;
+  const tiles = [
+    ["secrets", fs.length, "", `${fs.length - generic} typed &middot; ${generic} generic`],
+    ["copies on disk", fs.reduce((t, f) => t + f.copies, 0), "", `${state.locations || 0} locations`],
+    ["committed", count((f) => f.tracked), "hazard", "rotate, removing is not enough", "committed"],
+    ["live or valid", count((f) => f.live === "live" || f.state === "live-shape"), "danger", "act on these first"],
+    ["rotate only", count((f) => f.editable === false), "hazard", "cannot be edited in place"],
+    ["suppressed", sup, "", "filtered as known noise"],
+    ["handled", done, "safe", "this session"],
+  ];
+  $("tiles").innerHTML = tiles.map(([label, n, tone, sub, act]) =>
+    `<${act ? `button data-act="${act}"` : "div"} class="tile ${n ? tone : "zero"}">
+      <span>${label}</span><b>${n}</b><small>${sub}</small></${act ? "button" : "div"}>`).join("");
+  const byRule = new Map(), byArea = new Map();
+  for (const f of fs) {
+    byRule.set(f.rule, (byRule.get(f.rule) || 0) + 1);
+    for (const a of new Set(f.paths.map(area))) byArea.set(a, (byArea.get(a) || 0) + 1);
+  }
+  bars("byRule", topN(byRule), (k) => (k.includes("generic") ? "" : "typed"));
+  bars("byArea", topN(byArea));
+}
+
 function render() {
+  dashboard();
   const rows = visible();
   const n = state.findings.length;
   $("count").textContent = n
@@ -251,6 +322,13 @@ async function load(path, body) {
 }
 
 $("rows").addEventListener("change", syncApply);
+// A bar filters to itself; clicking the active one clears the filter.
+$("dash").addEventListener("click", (e) => {
+  const bar = e.target.closest(".bar-row"), tile = e.target.closest("[data-act]");
+  if (bar) $("filter").value = $("filter").value === bar.dataset.q ? "" : bar.dataset.q;
+  if (tile) $("onlyCommitted").checked = !$("onlyCommitted").checked;
+  if (bar || tile) render();
+});
 $("filter").addEventListener("input", render);
 $("onlyCommitted").addEventListener("change", render);
 $("all").onclick = () => { document.querySelectorAll(".pick:not(:disabled)").forEach((c) => (c.checked = true)); syncApply(); };
