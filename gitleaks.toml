@@ -61,10 +61,10 @@ paths = [
   # the tool, in the same category as node_modules. One catalogue alone accounted
   # for 41 findings on the machine this was measured against.
   '''(^|/)\.(claude|cursor|codeium|continue)/plugins/(marketplaces|cache)/''',
-  '''(^|/)\.(claude|cursor)/(ide|statsig|shell-snapshots)/''',
+  '''(^|/)\.(claude|cursor)/(ide|statsig|shell-snapshots|sessions)/''',
   # local application databases and their write-ahead logs: page contents and
   # content hashes, not credentials anyone can act on
-  '''\.(db|db-wal|db-shm|sqlite|sqlite3)$''',
+  '''\.(db|sqlite3?)(-wal|-shm|-journal)?$''',
   # OS and virtualisation caches, reached once the default scope became $HOME
   '''(^|/)Library/(Caches|Containers|Group Containers)/''',
   '''(^|/)Library/Developer/(CoreSimulator|Xcode/DerivedData)/''',
@@ -73,5 +73,47 @@ paths = [
   '''(^|/)(\.Trash|\.local/share/Trash)/''',
   '''(?i)(^|/)\$RECYCLE\.BIN/''',
   '''(^|/)(OrbStack|\.orbstack|\.vagrant\.d|VirtualBox VMs)/''',
-  '''\.(iso|dmg|vmdk|qcow2|img)$''',
+  '''(?i)\.(iso|dmg|vmdk|vdi|vhdx?|qcow2|img|sparsebundle|sparseimage)$''',
+  # macOS app bundles and their vendored frameworks: somebody else's compiled
+  # code, in the same category as node_modules.
+  '''(?i)\.(app|framework|kext|xpc|bundle)/''',
+  '''(^|/)(Program Files|Program Files \(x86\)|Windows|WinSxS)/''',
+  # media libraries and media files. gitleaks reads every byte of a photo library
+  # and can only find entropy in it.
+  '''(?i)\.(photoslibrary|musiclibrary|tvlibrary|imovielibrary|fcpbundle|aplibrary|logicx|band)/''',
+  '''(?i)\.(jpe?g|png|gif|bmp|tiff?|heic|heif|webp|ico|icns|svg|psd|ai|raw|cr2|nef|arw|dng|mp[34]|m4[avpr]|mov|avi|mkv|wmv|flv|wav|aiff?|flac|ogg|opus|webm)$''',
+  # compiled objects, archives and installers
+  '''(?i)\.(zip|gz|tgz|bz2|xz|zst|7z|rar|lz4|jar|war|ear|whl|crate|gem|nupkg|deb|rpm|pkg|msi|cab|exe|dll|dylib|so(\.[0-9.]+)?|[ao]|obj|lib|class|wasm|pdb|node|bin|pack|idx)$''',
+  # model weights and datasets: gigabytes of float32
+  '''(?i)\.(gguf|safetensors|ckpt|pt|pth|onnx|mlmodel|mlpackage|h5|hdf5|npy|npz|pb|tflite|bin\.gz|parquet|arrow|feather|orc|avro)$''',
+  # documents and fonts: compressed or binary containers, not readable as text
+  '''(?i)\.(pdf|docx?|xlsx?|pptx?|odt|ods|odp|epub|mobi|ttf|otf|ttc|woff2?|eot|dfont)$''',
+  # package manager and toolchain caches: third-party content, same as node_modules
+  '''(^|/)\.npm/_cacache/''',
+  # browser builds downloaded by test tools: Chromium ships keys in its own
+  # resources, public to everyone who downloads it
+  '''(^|/)(ms-playwright|\.?puppeteer|\.cache/selenium)/''',
+  '''(^|/)go/pkg/(mod|sumdb)/''',
+  '''(^|/)\.(cargo/registry|rustup|gradle/caches|m2/repository|ivy2|pub-cache|nuget/packages|stack|cabal|gem|rbenv|pyenv|nvm|bun/install/cache|deno)/''',
+  '''(^|/)(\.?(home|linux)?brew|homebrew)/(Cellar|Caskroom|Library)/''',
+  '''(^|/)\.local/(lib|share/(Trash|Steam|containers|virtualenvs))/''',
+  '''(^|/)(snap|\.var/app)/''',
+  # the rest of the macOS Library heavyweights. Application Support is deliberately
+  # NOT here: that is where Slack, the browsers and the CLIs keep their tokens.
+  '''(^|/)Library/(Developer|Metadata|Mail|Messages|Photos|Biome|Suggestions|Assistant|Autosave Information|Daemon Containers|Saved Application State|Application Support/(MobileSync|Steam|CrashReporter))/''',
+  '''(^|/)(Cache|Code Cache|GPUCache|DawnCache|ShaderCache|GrShaderCache|CacheStorage|Service Worker)/''',
+  '''(^|/)AppData/Local/(CrashDumps|Microsoft/Windows|NuGet|pip)/''',
+  # browser extension code (Chromium extension ids are 32 letters a-p) and Firefox
+  # .xpi packages: vendored JS, 85% of one browser profile here. Extension
+  # *storage* (Local Extension Settings, IndexedDB) stays scanned: wallets live there.
+  '''(^|/)Extensions/[a-p]{32}/''',
+  '''(?i)\.xpi$''',
+  # auto-updater state: version hashes that only ever match the generic rule
+  '''(^|/)[A-Za-z]*Updater/''',
+  '''(^|/)(component_crx_cache|[A-Za-z]*DawnCache|optimization_guide_model_store)/''',
+  # cloud-drive mounts (Google Drive, Dropbox, OneDrive, iCloud via File Provider).
+  # Files there are often online-only, so reading them downloads the whole drive:
+  # 66k files on the machine this was measured on. Scan one with --root.
+  '''(^|/)Library/CloudStorage/''',
+  '''(^|/)(Google Drive|My Drive|Dropbox|OneDrive|iCloud Drive)( \([^/)]*\))?/''',
 ]
