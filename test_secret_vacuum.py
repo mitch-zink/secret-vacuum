@@ -1630,6 +1630,7 @@ def test_findings_nobody_could_use_are_suppressed_and_named(tmp_path: Path):
     blob = tmp_path / "b.jsonl"
     blob.write_text("A1b2" * 40 + "Zm9vYmFyYmF6cXV4\n")
     cases = {
+        "session-log": finding("/u/.claude/projects/x/s.jsonl", "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
         "embedded-blob": finding(str(blob), "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
         "expired-jwt": finding("/x/auth.json", _jwt(exp=past)),
         "public-jwt": finding("/x/app.env", _jwt(role="anon", exp=far)),

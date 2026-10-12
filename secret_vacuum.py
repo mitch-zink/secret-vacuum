@@ -210,6 +210,10 @@ SUPPRESSORS = [
                check=lambda f: "generic" in f.rule and bool(NOT_A_CREDENTIAL.search(line_before(f)))),
     Suppressor("embedded-blob", "a slice of a long base64 blob, such as an embedded image",
                check=lambda f: "generic" in f.rule and bool(re.fullmatch(r"[A-Za-z0-9+/]{60}", line_before(f)))),
+    Suppressor("session-log", "generic match in an AI session log or skill doc, mostly prose and tool output; typed rules still report",
+               check=lambda f: "generic" in f.rule and bool(re.search(
+                   r"(?i)/\.(claude|cursor)/(projects|file-history|paste-cache|todos|skills|plans)/",
+                   f.path.replace("\\", "/")))),
     Suppressor("example-file", "a template file, its values are samples",
                check=lambda f: ("generic" in f.rule or f.rule == "credential-file-assignment")
                and bool(re.search(r"(?i)\.(example|sample|template|dist)$", base_name(f.path)))),
