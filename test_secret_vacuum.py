@@ -1625,14 +1625,18 @@ def test_findings_nobody_could_use_are_suppressed_and_named(tmp_path: Path):
     far, past = 4102444800, 1600000000
     cache = tmp_path / "cache.json"
     cache.write_text('{"path":"p","reviewed_commit":"' + "0123abcd" * 5 + '"}\n')
+    meta = tmp_path / "t.jsonl"
+    meta.write_text('{"gitBranch":"HEAD","slug":"Zm9vYmFyYmF6cXV4"}\n')
+    blob = tmp_path / "b.jsonl"
+    blob.write_text("A1b2" * 40 + "Zm9vYmFyYmF6cXV4\n")
     cases = {
+        "embedded-blob": finding(str(blob), "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
         "expired-jwt": finding("/x/auth.json", _jwt(exp=past)),
         "public-jwt": finding("/x/app.env", _jwt(role="anon", exp=far)),
         "public-env": finding("/x/.env", "pk" + "abcdef0123456789xyz", rule="generic-api-key",
                               match="VITE_SUPABASE_ANON_KEY=x"),
         "git-sha": finding(str(cache), "0123abcd" * 5, rule="sourcegraph-access-token"),
-        "not-a-credential": finding("/x/log", "Zm9vYmFyYmF6cXV4", rule="generic-api-key",
-                                    match="'apigw-requestid': 'Zm9vYmFyYmF6cXV4'"),
+        "not-a-credential": finding(str(meta), "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
         "publishable-key": finding("/x/.env", "sb_publishable_" + "abcdef0123456789"),
         "example-file": finding("/x/.env.example", "acct" + "12345678", rule="generic-api-key"),
     }

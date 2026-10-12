@@ -162,6 +162,11 @@ class Suppressor:
         return bool(self.pattern.search(f.secret if self.target == "secret" else f.match))
 
 
+NOT_A_CREDENTIAL = re.compile(
+    r"(?i)(request[-_]?id|page[-_]?token|next[-_]?token|cursor|etag|correlation[-_]?id|trace[-_]?id"
+    r"|idempotency[-_]?key|token[ _]prefix|gitBranch|slug)[\"']?\s*[:=]\s*[\"']?$")
+
+
 SUPPRESSORS = [
     Suppressor("placeholder", "documentation placeholder, not a value", re.compile(
         r"""(?ix) ^(bearer\s+)? [<{\[]? (your|my)[-_ ] | ^[<{].+[>}]$
@@ -201,9 +206,10 @@ SUPPRESSORS = [
                bool(re.fullmatch(r"[0-9a-f]{40}", f.secret)) and bool(re.search(
                    r"(?i)(sha|commit|revision|rev|hash|checksum)\w*[\"']?\s*[:=]\s*[\"']?$",
                    line_before(f)))),
-    Suppressor("not-a-credential", "a request id, page cursor or token prefix", re.compile(
-        r"(?i)(request[-_]?id|page[-_]?token|next[-_]?token|cursor|etag|correlation[-_]?id"
-        r"|trace[-_]?id|token[ _]prefix)[\"']?\s*[:=]"), target="match", generic_only=True),
+    Suppressor("not-a-credential", "a request id, session slug, idempotency key or token prefix",
+               check=lambda f: "generic" in f.rule and bool(NOT_A_CREDENTIAL.search(line_before(f)))),
+    Suppressor("embedded-blob", "a slice of a long base64 blob, such as an embedded image",
+               check=lambda f: "generic" in f.rule and bool(re.fullmatch(r"[A-Za-z0-9+/]{60}", line_before(f)))),
     Suppressor("example-file", "a template file, its values are samples",
                check=lambda f: ("generic" in f.rule or f.rule == "credential-file-assignment")
                and bool(re.search(r"(?i)\.(example|sample|template|dist)$", base_name(f.path)))),
