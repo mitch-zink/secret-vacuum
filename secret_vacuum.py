@@ -92,8 +92,6 @@ def default_roots() -> list[str]:
     return [str(Path.home())]
 
 
-# Rewriting shell history is its own kind of damage, so history files are
-# shown and redactable but never removable as a whole file.
 def norm_path(path: str) -> str:
     """One spelling per file, whichever detector found it.
 
@@ -110,6 +108,8 @@ def base_name(path: str) -> str:
     return re.split(r"[\\/]", str(path))[-1]
 
 
+# Rewriting shell history is its own kind of damage, so history files are
+# shown and redactable but never removable as a whole file.
 # Matched on the file name: the old suffix test looked for "/.bash_history",
 # which no Windows path contains, so the guard quietly did nothing there.
 REDACT_ONLY = frozenset({
@@ -249,11 +249,6 @@ def partition(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
 # both take this for their whole body, so the guarantee holds for any caller and
 # not just for the request handler.
 MUTATE = threading.Lock()
-
-# Roots the last scan could not read. Surfaced in the CLI and in the UI, because a
-# root that failed is not a root that is clean.
-
-
 
 def _binary(name: str) -> str:
     """Resolve once, absolutely. A security tool should not let PATH decide which
@@ -762,7 +757,7 @@ def parse_kubeconfig(path: Path, text: str) -> list[Finding]:
     """token, password and client-key-data live under users[].user. Parsed rather
     than pattern-matched because removing one has to take its contexts with it."""
     out = []
-    user, name = None, ""
+    name = ""
     for i, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
         if stripped.startswith("- name:"):
@@ -771,7 +766,6 @@ def parse_kubeconfig(path: Path, text: str) -> list[Finding]:
         if m and len(m.group(2)) >= 8:
             out.append(_mk(str(path), i, "kubeconfig-credential",
                            f"{m.group(1)} for user {name or '?'}", m.group(2)))
-    del user
     return out
 
 

@@ -59,7 +59,10 @@ def sandbox(tmp_path: Path) -> None:
     sv.IGNORE_FILE = sv.STATE / ".gitleaksignore"
 
 
-# --------------------------------------------------------------- guarantee 1: no value on disk
+def _jwt(**claims) -> str:
+    # built at runtime so this file does not trip its own scanner
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return ".".join([enc({"alg": "HS256", "typ": "JWT"}), enc(claims), "c2lnbmF0dXJlLXZhbHVl"])
 
 
 def test_mask_never_reveals_more_than_eight_characters():
@@ -1587,6 +1590,19 @@ def test_the_two_detectors_agree_on_what_one_file_is_called(tmp_path: Path):
     assert sv.norm_path(mixed) == sv.norm_path(str(env))
 
 
+def test_the_plain_runner_sees_every_test():
+    """CI runs this file directly. A test defined below the __main__ block is
+    invisible to that runner while pytest still finds it."""
+    import ast
+    last = ast.parse(Path(__file__).read_text(encoding="utf-8")).body[-1]
+    assert isinstance(last, ast.If) and "__main__" in ast.unparse(last.test)
+
+
+def test_typed_secrets_in_session_logs_are_kept():
+    f = finding("/u/.claude/projects/x/s.jsonl", "sk-" + "a1B2" * 12, rule="openai-api-key")
+    assert sv.partition([f])[0] == [f]
+
+
 # --------------------------------------------------------------- runner
 
 
@@ -1608,14 +1624,6 @@ def main() -> int:
     return 1 if failed else 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
-def _jwt(**claims) -> str:
-    # built at runtime so this file does not trip its own scanner
-    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
-    return ".".join([enc({"alg": "HS256", "typ": "JWT"}), enc(claims), "c2lnbmF0dXJlLXZhbHVl"])
 
 
 def test_findings_nobody_could_use_are_suppressed_and_named(tmp_path: Path):
@@ -1656,3 +1664,7 @@ def test_a_jwt_that_still_grants_access_is_kept(tmp_path: Path):
     sha_in_prose = finding(str(notes), "0123abcd" * 5, rule="sourcegraph-access-token")
     kept, _ = sv.partition([svc, noexp, sha_in_prose])
     assert kept == [svc, noexp, sha_in_prose]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
