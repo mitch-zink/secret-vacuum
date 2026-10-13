@@ -241,7 +241,7 @@ SUPPRESSORS = [
                bool(re.fullmatch(r"[0-9a-f]{40}", f.secret)) and bool(re.search(
                    r"(?i)(sha|commit|revision|rev|hash|checksum)\w*[\"']?\s*[:=]\s*[\"']?$",
                    line_before(f)))),
-    Suppressor("not-a-credential", "a request id, session slug, idempotency key or token prefix",
+    Suppressor("not-a-credential", "a request id, session slug, identifier or hash under a key-like name",
                check=lambda f: "generic" in f.rule and bool(NOT_A_CREDENTIAL.search(line_before(f)))),
     Suppressor("embedded-blob", "a slice of a long base64 blob, such as an embedded image",
                check=lambda f: "generic" in f.rule and bool(re.fullmatch(r"[A-Za-z0-9+/]{60}", line_before(f)))),
