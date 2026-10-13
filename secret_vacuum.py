@@ -547,9 +547,6 @@ def scan(roots: list[str], progress: bool = False,
     warnings = [] if warnings is None else warnings
     del failures[:], suppressed[:], warnings[:]
     warnings += root_ignore_warnings(paths)
-    if progress:
-        for w in warnings:
-            print(f"  NOTE {w}", flush=True)
     raw: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(scan_root, p): p for p in paths}
