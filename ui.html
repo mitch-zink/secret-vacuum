@@ -66,6 +66,7 @@
     background:var(--surface);color:var(--ink)}
   .note{background:var(--hazard-bg);color:var(--hazard);border-left:3px solid var(--hazard);
     padding:11px 14px;margin:14px 0;font-size:13px}
+  .note.error{background:var(--danger-bg);color:var(--danger);border-color:var(--danger)}
   .empty{padding:60px 0;text-align:center;color:var(--faint)}
   footer{padding:14px 20px;color:var(--faint);font:11.5px var(--mono);border-top:1px solid var(--rule)}
   .dash{display:grid;gap:14px;margin:16px 0 6px}
@@ -145,7 +146,12 @@ const $ = (id) => document.getElementById(id);
 // become markup. Everything interpolated into innerHTML goes through this.
 const esc = (v) =>
   String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-let state = { findings: [], apply: false }, results = {};
+let state = { findings: [], apply: false }, results = {}, busy = false, lastError = "";
+// What the person has picked and chosen, by value key. Kept outside the table so
+// re-rendering it (on every filter keystroke) never throws a selection away.
+const picks = new Set(), choice = {};
+const allowed = (f, a) => a === "ignore" || (f.editable !== false && (a !== "remove" || f.removable));
+const handled = (k) => !!(results[k] && results[k].ok);
 
 const api = async (path, body) => {
   const r = await fetch(path, {
@@ -153,7 +159,11 @@ const api = async (path, body) => {
     headers: { "X-SV-Token": TOKEN, ...(body ? { "Content-Type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
-  return r.json();
+  try {
+    return await r.json();
+  } catch {
+    throw new Error(`HTTP ${r.status}`); // a 403 "forbidden" page is not JSON
+  }
 };
 
 function visible() {
@@ -169,9 +179,11 @@ function visible() {
 // Bucket a location by the folder a person would recognise: two levels under
 // home, three under the OS app-storage dirs where the app name is the third.
 function area(p) {
-  const parts = p.replace(/:\d+$/, "").replace(/^~[\\/]/, "").split(/[\\/]/).slice(0, -1);
-  const deep = /^(Library|AppData)$/.test(parts[0]) ? 3 : 2;
-  return parts.length ? "~/" + parts.slice(0, deep).join("/") : "~";
+  const clean = p.replace(/:\d+$/, ""), home = /^~[\\/]/.test(clean);
+  const parts = clean.replace(/^~[\\/]/, "").split(/[\\/]/).filter(Boolean).slice(0, -1);
+  const head = parts.slice(0, /^(Library|AppData)$/.test(parts[0]) ? 3 : 2).join("/");
+  if (home) return head ? "~/" + head : "~";
+  return /^[A-Za-z]:/.test(clean) ? head : "/" + head; // outside home: absolute, POSIX or drive
 }
 
 const topN = (counter, n = 8) => [...counter].sort((a, b) => b[1] - a[1]).slice(0, n);
@@ -190,13 +202,15 @@ function dashboard() {
   const count = (pred) => fs.filter(pred).length;
   const generic = count((f) => f.rule.includes("generic"));
   const done = Object.values(results).filter((r) => r.ok).length;
+  const files = new Set(fs.flatMap((f) => f.paths.map((p) => p.replace(/:\d+$/, "")))).size;
+  const revoked = (state.suppressed || []).find((r) => r.rule === "revoked");
   const tiles = [
     ["secrets", fs.length, "", `${fs.length - generic} typed &middot; ${generic} generic`],
-    ["copies on disk", fs.reduce((t, f) => t + f.copies, 0), "", `${state.locations || 0} locations`],
+    ["copies on disk", fs.reduce((t, f) => t + f.copies, 0), "", `in ${files} file${files === 1 ? "" : "s"}`],
     ["committed", count((f) => f.tracked), "hazard", "rotate, removing is not enough", "committed"],
-    ["live or valid", count((f) => f.live === "live" || f.state === "live-shape"), "danger", "act on these first"],
+    ["valid shape", count((f) => f.live === "live" || f.state === "live-shape"), "danger", "not ruled out offline"],
     ["rotate only", count((f) => f.editable === false), "hazard", "cannot be edited in place"],
-    ["suppressed", sup, "", "filtered as known noise"],
+    ["suppressed", sup, "", revoked ? `known noise, ${revoked.count} revoked` : "filtered as known noise"],
     ["handled", done, "safe", "this session"],
   ];
   $("tiles").innerHTML = tiles.map(([label, n, tone, sub, act]) =>
@@ -246,7 +260,8 @@ function render() {
            r.paths.map(esc).join("<br>")}`).join("<br><br>")}</div></details>
        Re-run with <code>--no-filter</code> to scan without them.</div>`
     : "";
-  $("banner").innerHTML = failed + warned + filtered + (committed
+  const error = lastError ? `<div class="note error"><b>${esc(lastError)}</b></div>` : "";
+  $("banner").innerHTML = error + failed + warned + filtered + (committed
     ? `<div class="note"><b>${committed} of these appear in a committed file.</b> Removing the file here does
        not unleak the value. It is in every clone and in the history. Rotate those credentials.
        They are still removable; you just need to know that removing is not enough.</div>`
@@ -256,22 +271,24 @@ function render() {
   $("empty").hidden = rows.length > 0;
   $("empty").textContent = state.findings.length
     ? "Nothing matches this filter."
-    : "No plaintext secrets found in the scanned roots.";
+    : lastError ? "" : "No plaintext secrets found in the scanned roots.";
 
   $("rows").innerHTML = rows
     .map((f) => {
       const r = results[f.key];
+      if (handled(f.key)) picks.delete(f.key);
+      const want = choice[f.key] || f.suggested;
       const opts = ["remove", "redact", "ignore"]
         .map((a) => {
-          // Nothing editable about terraform state: a line replace leaves valid
-          // JSON that no longer describes reality, and deleting it is worse.
-          const off = (a === "remove" && !f.removable) || (a !== "ignore" && f.editable === false);
-          const sel = a === f.suggested ? " selected" : "";
-          return `<option value="${a}"${sel}${off ? " disabled" : ""}>${a}</option>`;
+          // Nothing editable about terraform state or an app's own database:
+          // a line replace corrupts them, and deleting is worse.
+          const sel = a === want ? " selected" : "";
+          return `<option value="${a}"${sel}${allowed(f, a) ? "" : " disabled"}>${a}</option>`;
         })
         .join("");
       return `<tr class="${r && r.ok ? "gone" : ""}">
-        <td><input type="checkbox" class="pick" data-fp="${f.key}" ${r && r.ok ? "disabled" : ""}></td>
+        <td><input type="checkbox" class="pick" data-fp="${f.key}" ${picks.has(f.key) ? "checked" : ""}
+          ${r && r.ok ? "disabled" : ""}></td>
         <td class="hide val" title="${f.length} chars">${esc(f.masked)}</td>
         <td><div class="path">${esc(f.display)}:${f.line}</div>
             <div class="rule">${f.copies > 1
@@ -303,11 +320,13 @@ function render() {
   syncApply();
 }
 
-const picked = () => [...document.querySelectorAll(".pick:checked")].map((c) => c.dataset.fp);
+const picked = () => [...picks];
 
 function syncApply(skipped) {
   const n = picked().length;
-  $("apply").disabled = n === 0 || !state.apply;
+  $("apply").disabled = busy || n === 0 || !state.apply;
+  $("rescan").disabled = $("undo").disabled = busy;
+  $("rescan").textContent = busy ? "Working\u2026" : "Rescan";
   $("apply").textContent = state.apply ? (n ? `Apply to ${n} selected` : "Apply") : "Preview mode";
   $("apply").title = state.apply ? "" : "Restart with --apply to make changes";
   $("note").textContent = skipped
@@ -315,20 +334,38 @@ function syncApply(skipped) {
     : "";
 }
 
+// One request at a time: a second click while one is in flight is ignored rather
+// than sent, so a double-click can never apply a batch twice.
 async function load(path, body) {
-  $("empty").textContent = "Scanning…";
-  const data = await api(path, body);
-  if (data.error) {
-    $("empty").textContent = data.error;
-    $("empty").hidden = false;
-    if (!data.findings) return;
+  if (busy) return;
+  busy = true;
+  syncApply();
+  try {
+    const data = await api(path, body);
+    // An undo with nothing to restore answers ok: false with a reason; say it.
+    lastError = data.error || (data.ok === false ? data.detail : "");
+    if (data.findings) {
+      if (path !== "/api/apply") {
+        picks.clear();
+        for (const k in choice) delete choice[k];
+      }
+      state = data;
+      results = Object.fromEntries((data.results || []).map((r) => [r.key, r]));
+    }
+  } catch (e) {
+    lastError = `Lost contact with secret-vacuum (${e.message}). It may have stopped: run python3 secret_vacuum.py again.`;
+  } finally {
+    busy = false;
+    render();
   }
-  if (data.results) for (const r of data.results) results[r.key] = r;
-  state = data;
-  render();
 }
 
-$("rows").addEventListener("change", syncApply);
+$("rows").addEventListener("change", (e) => {
+  const fp = e.target.dataset.fp;
+  if (e.target.matches(".pick")) e.target.checked ? picks.add(fp) : picks.delete(fp);
+  if (e.target.matches(".act")) choice[fp] = e.target.value;
+  syncApply();
+});
 // A bar filters to itself; clicking the active one clears the filter.
 $("dash").addEventListener("click", (e) => {
   const bar = e.target.closest(".bar-row"), tile = e.target.closest("[data-act]");
@@ -338,7 +375,7 @@ $("dash").addEventListener("click", (e) => {
 });
 $("filter").addEventListener("input", render);
 $("onlyCommitted").addEventListener("change", render);
-$("all").onclick = () => { document.querySelectorAll(".pick:not(:disabled)").forEach((c) => (c.checked = true)); syncApply(); };
+$("all").onclick = () => { for (const f of visible()) if (!handled(f.key)) picks.add(f.key); render(); };
 // Set every selected row at once. A row that cannot take the action keeps its own:
 // "remove" on a shell history would delete the file to get at one line of it.
 $("bulk").onchange = (e) => {
@@ -346,23 +383,20 @@ $("bulk").onchange = (e) => {
   if (!want) return;
   let skipped = 0;
   for (const fp of picked()) {
-    const sel = document.querySelector(`.act[data-fp="${fp}"]`);
-    const opt = [...sel.options].find((o) => o.value === want);
-    if (opt && !opt.disabled) sel.value = want;
+    const f = state.findings.find((x) => x.key === fp);
+    if (f && allowed(f, want)) choice[fp] = want;
     else skipped++;
   }
   e.target.value = "";
+  render();
   syncApply(skipped);
 };
-$("none").onclick = () => { document.querySelectorAll(".pick").forEach((c) => (c.checked = false)); syncApply(); };
-$("rescan").onclick = () => { results = {}; load("/api/rescan", {}); };
+$("none").onclick = () => { picks.clear(); render(); };
+$("rescan").onclick = () => load("/api/rescan", {});
 $("undo").onclick = () => load("/api/undo", {});
 $("apply").onclick = () => {
-  const acts = picked().map((fp) => ({
-    key: fp,
-    action: document.querySelector(`.act[data-fp="${fp}"]`).value,
-  }));
   const at = (key) => state.findings.find((f) => f.key === key);
+  const acts = picked().map((fp) => ({ key: fp, action: choice[fp] || at(fp)?.suggested || "ignore" }));
   const copies = acts.reduce((t, a) => t + (at(a.key)?.copies || 0), 0);
   // Remove takes the whole file, so name the files rather than only counting
   // secrets. Deleting a dotfile to get at one line of it is the mistake this

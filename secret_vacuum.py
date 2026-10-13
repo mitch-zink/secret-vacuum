@@ -1645,6 +1645,7 @@ class Handler(BaseHTTPRequestHandler):
                 # the connection.
                 return self._json({"error": f"scan failed: {e}", **self.snapshot()}, 503)
             self.state["scan"] = published
+            self.state["results"] = {}
             return self._json(self.snapshot())
         if not self.state["apply"]:
             return self._json({"error": "preview mode: restart with --apply to make changes"}, 403)
@@ -1662,12 +1663,16 @@ class Handler(BaseHTTPRequestHandler):
                 out = apply_actions(self.state["scan"]["groups"], body.get("actions"))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
+            self.state.setdefault("results", {}).update({r["key"]: r for r in out["results"]})
         elif route == "/api/undo":
             out = undo()
+            if out["ok"]:
+                self.state["results"] = {}
         else:
             return self._send(404, b"not found", "text/plain")
         # Handled findings stay in the list so the UI can show what happened to
-        # each one. Rescan is what clears them.
+        # each one. Rescan is what clears them. The snapshot's results win: they
+        # hold every outcome this session, not only this request's.
         self._json({**out, **self.snapshot()})
 
     def snapshot(self) -> dict:
@@ -1686,6 +1691,7 @@ class Handler(BaseHTTPRequestHandler):
             "failures": list(scanned["failures"]),
             "warnings": list(scanned["warnings"]),
             "suppressed": scanned["suppressed"],
+            "results": list(self.state.get("results", {}).values()),
         }
 
 
@@ -1714,6 +1720,9 @@ def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
     Handler.state = {
         "scan": _scan_state(findings, failures, suppressed, warnings),
         "live": live or {},
+        # What happened to each row this session, kept here so a reload or an undo
+        # shows the truth rather than whatever the page last remembered.
+        "results": {},
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
