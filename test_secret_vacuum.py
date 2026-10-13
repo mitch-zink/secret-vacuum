@@ -692,6 +692,7 @@ def test_scan_json_output_is_grouped_and_carries_no_values(tmp_path: Path):
     assert FAKE_STRIPE not in payload
     assert "key" in groups[0] and "paths" in groups[0]
     assert "suppressed" in doc, "the machine surface must report what was filtered too"
+    assert doc["failures"] == [] and doc["warnings"] == []
 
 
 def test_a_non_ascii_token_is_refused_not_a_crash(tmp_path: Path):
@@ -783,6 +784,10 @@ def test_one_bad_root_does_not_discard_the_others(tmp_path: Path):
         found = sv.scan([str(good), str(bad)], failures=failures)
         assert len(found) == 1, "the healthy root's findings survive"
         assert failures and "bad" in failures[0], "the failure is reported to the caller"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = sv.main(["scan", "--json", "--root", str(good), "--root", str(bad)])
+        assert code == 1, "a partial scan is not a clean exit"
+        assert json.loads(out.getvalue())["failures"], "and the machine surface says why"
     finally:
         sv.scan_root = real_root
 
@@ -1149,6 +1154,12 @@ def test_a_filesystem_error_in_a_route_answers_the_request():
     Stub()._guard(boom)
     assert sent["code"] == 500, sent
     assert "PermissionError" in sent["payload"]["error"], sent
+
+    def bad_value():
+        raise ValueError("not an OSError")
+
+    Stub()._guard(bad_value)
+    assert sent["code"] == 500 and "ValueError" in sent["payload"]["error"], sent
 
 
 def test_an_unexpected_report_shape_is_a_scan_failure(tmp_path: Path):

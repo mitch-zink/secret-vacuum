@@ -22,8 +22,6 @@ import json
 import urllib.error
 import urllib.request
 
-MODES = ("never", "offline", "readonly", "all")
-
 # rule id -> (host, url, header template). The host is pinned: a verifier may only
 # ever talk to the service that issued the credential it is checking.
 VERIFIERS: dict[str, tuple[str, str, dict]] = {

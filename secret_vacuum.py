@@ -1607,11 +1607,11 @@ class Handler(BaseHTTPRequestHandler):
         self._guard(self._post)
 
     def _guard(self, handler) -> None:
-        """Answer every request, even a failing one. Anything reaching here is a
-        filesystem error the route did not expect."""
+        """Answer every request, even a failing one. Anything reaching here is an
+        error the route did not expect."""
         try:
             handler()
-        except OSError as e:
+        except Exception as e:  # noqa: BLE001 - a request must always get an answer
             self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
     def _get(self) -> None:
@@ -1810,7 +1810,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
     ap.add_argument("--quick", action="store_true",
                     help="scan the known credential stores only, not the whole home directory")
-    ap.add_argument("--verify", choices=("never", "offline", "live"), default="offline",
+    ap.add_argument("--verify", choices=("offline", "live"), default="offline",
                     help="offline (default) checks shape and expiry with no network; "
                          "live also asks each provider, which writes to their audit log")
     ap.add_argument("--docker", action="store_true",
@@ -1860,7 +1860,8 @@ def main(argv: list[str] | None = None) -> int:
                               "failures": failures, "warnings": warnings}, indent=1))
         else:
             print_table(findings, failures, dropped, warnings)
-        return 0
+        # 0 full scan, 1 some roots could not be read, 2 nothing could be (above).
+        return 1 if failures else 0
 
     serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures,
           suppressed=dropped, warnings=warnings)
