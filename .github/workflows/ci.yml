@@ -45,7 +45,7 @@ jobs:
           "TMPDIR=$env:RUNNER_TEMP\svt" | Out-File $env:GITHUB_ENV -Append
       - run: gitleaks version
       - run: pip install --quiet pytest
-      - run: python -m pytest test_secret_vacuum.py -q --basetemp="${{ runner.temp }}/svt/pt"
+      - run: python -m pytest test_secret_vacuum.py -q
       # The no-framework entry point is documented, so it is tested too.
       - run: python test_secret_vacuum.py
 
