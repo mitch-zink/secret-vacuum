@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import base64
 import json
 import shutil
@@ -1588,6 +1589,33 @@ def test_the_two_detectors_agree_on_what_one_file_is_called(tmp_path: Path):
 
     mixed = str(env).replace("\\", "/")
     assert sv.norm_path(mixed) == sv.norm_path(str(env))
+
+
+def test_a_gitleaksignore_in_the_working_directory_hides_nothing(tmp_path: Path):
+    sandbox(tmp_path)  # no ~/.secret-vacuum/.gitleaksignore yet
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "app.sh").write_text(f"export STRIPE={FAKE_STRIPE}\n")
+    first = sv.scan([str(tree)])
+    assert first, "precondition: the planted value is found"
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / ".gitleaksignore").write_text("\n".join(f.fingerprint for f in first) + "\n")
+    old = os.getcwd()
+    os.chdir(cwd)
+    try:
+        assert sv.scan([str(tree)]), "a stray ignore file in the cwd must not hide findings"
+    finally:
+        os.chdir(old)
+
+
+def test_a_root_level_gitleaksignore_is_reported(tmp_path: Path):
+    sandbox(tmp_path)
+    (tmp_path / ".gitleaksignore").write_text("# comment\na:b:1\nc:d:2\n")
+    (tmp_path / "x.txt").write_text("nothing here\n")
+    warnings: list[str] = []
+    sv.scan([str(tmp_path)], warnings=warnings)
+    assert len(warnings) == 1 and "2 entries" in warnings[0]
 
 
 def test_the_plain_runner_sees_every_test():

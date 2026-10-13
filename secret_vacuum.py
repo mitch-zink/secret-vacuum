@@ -479,8 +479,9 @@ def scan_root(root: Path) -> list[dict]:
         # allowlist away its leaks behind our back.
         "--config", str(CONFIG_FILE),
     ]
-    if IGNORE_FILE.exists():
-        cmd += ["--gitleaks-ignore-path", str(IGNORE_FILE)]
+    # Pinned so gitleaks never falls back to "." and honours a .gitleaksignore in
+    # whatever directory the user happened to run us from.
+    cmd += ["--gitleaks-ignore-path", str(IGNORE_FILE) if IGNORE_FILE.exists() else os.devnull]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     except OSError as e:
@@ -511,9 +512,25 @@ def scan_root(root: Path) -> list[dict]:
     return hits
 
 
+def root_ignore_warnings(roots: list[Path]) -> list[str]:
+    """gitleaks applies a .gitleaksignore at the top of each scanned directory and
+    offers no way to turn that off, so the findings it hides cannot be counted.
+    The least we can do is say the file is there."""
+    out = []
+    for root in roots:
+        f = root / ".gitleaksignore"
+        if root.is_dir() and f.is_file():
+            n = sum(1 for ln in f.read_text(errors="replace").splitlines()
+                    if ln.strip() and not ln.startswith("#"))
+            out.append(f"{display_path(str(f))}: gitleaks applies its {n} entr"
+                       f"{'y' if n == 1 else 'ies'} and the findings they hide are not counted")
+    return out
+
+
 def scan(roots: list[str], progress: bool = False,
          failures: list[str] | None = None,
-         suppressed: list[Finding] | None = None) -> list[Finding]:
+         suppressed: list[Finding] | None = None,
+         warnings: list[str] | None = None) -> list[Finding]:
     """A first run over a developer's whole code directory takes minutes, so say
     what is happening rather than looking hung."""
     wanted = [Path(r).expanduser() for r in roots]
@@ -527,7 +544,12 @@ def scan(roots: list[str], progress: bool = False,
     # other's failures the way a module global did.
     failures = [] if failures is None else failures
     suppressed = [] if suppressed is None else suppressed
-    del failures[:], suppressed[:]
+    warnings = [] if warnings is None else warnings
+    del failures[:], suppressed[:], warnings[:]
+    warnings += root_ignore_warnings(paths)
+    if progress:
+        for w in warnings:
+            print(f"  NOTE {w}", flush=True)
     raw: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(scan_root, p): p for p in paths}
@@ -1433,9 +1455,11 @@ class Handler(BaseHTTPRequestHandler):
             git_tracked.cache_clear()  # a file may have been committed since the last scan
             failures: list[str] = []
             dropped: list[Finding] = []
+            warnings: list[str] = []
             try:
-                found = scan(self.state["roots"], failures=failures, suppressed=dropped)
-                published = _scan_state(found, failures, dropped)
+                found = scan(self.state["roots"], failures=failures, suppressed=dropped,
+                             warnings=warnings)
+                published = _scan_state(found, failures, dropped, warnings)
             except (RuntimeError, OSError) as e:
                 # scan raises when no root could be read at all, and grouping
                 # shells out to git. Answer with the reason rather than dropping
@@ -1481,12 +1505,14 @@ class Handler(BaseHTTPRequestHandler):
             "gitleaks": self.state["gitleaks"],
             "batches": [b.name for b in batches()],
             "failures": list(scanned["failures"]),
+            "warnings": list(scanned["warnings"]),
             "suppressed": scanned["suppressed"],
         }
 
 
 def _scan_state(findings: list[Finding], failures: list[str] | None,
-                suppressed: list[Finding] | None = None) -> dict:
+                suppressed: list[Finding] | None = None,
+                warnings: list[str] | None = None) -> dict:
     """Everything a rescan replaces, in one object. Assigning groups, failures and
     the timestamp separately lets a reader pair one scan's findings with another
     scan's failure list, and a run whose roots could not be read would then show
@@ -1495,6 +1521,7 @@ def _scan_state(findings: list[Finding], failures: list[str] | None,
     return {
         "groups": {g.key: g for g in group_findings(findings)},
         "failures": list(failures or []),
+        "warnings": list(warnings or []),
         "suppressed": suppression_summary(suppressed or []),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -1502,9 +1529,10 @@ def _scan_state(findings: list[Finding], failures: list[str] | None,
 
 def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
           open_browser: bool = True, failures: list[str] | None = None,
-          suppressed: list[Finding] | None = None) -> str:
+          suppressed: list[Finding] | None = None,
+          warnings: list[str] | None = None) -> str:
     Handler.state = {
-        "scan": _scan_state(findings, failures, suppressed),
+        "scan": _scan_state(findings, failures, suppressed, warnings),
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
@@ -1564,22 +1592,26 @@ def run_live_verification(findings: list[Finding]) -> list[Finding]:
 
 
 def print_table(findings: list[Finding], failures: list[str] | None = None,
-                suppressed: list[Finding] | None = None) -> None:
+                suppressed: list[Finding] | None = None,
+                warnings: list[str] | None = None) -> None:
     groups = group_findings(findings)
-    if not groups:
-        print("No secrets found.")
-        _print_suppressed(suppressed)
-        return
-    print(f"{'VALUE':<18}  {'RULE':<24}  {'COPIES':>6}  {'FLAGS':<10}  FIRST SEEN")
+    if groups:
+        print(f"{'VALUE':<18}  {'RULE':<24}  {'COPIES':>6}  {'FLAGS':<10}  FIRST SEEN")
     for g in groups:
         print(f"{mask(g.lead.secret):<18}  {g.lead.rule[:24]:<24}  {len(g.members):>6}  "
               f"{'committed' if g.tracked else '':<10}  {display_path(g.lead.path)[-60:]}:{g.lead.start_line}")
-
+    # A failed root or an uncountable ignore file is reported even when nothing was
+    # found: "No secrets found" next to an unscanned root is not a clean bill.
     for f in failures or []:
         print(f"  WARNING unscanned: {f[:200]}")
-    tracked = sum(g.tracked for g in groups)
-    print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
-          f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
+    for w in warnings or []:
+        print(f"  NOTE {w}")
+    if groups:
+        tracked = sum(g.tracked for g in groups)
+        print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
+              f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
+    else:
+        print("No secrets found.")
     _print_suppressed(suppressed)
 
 
@@ -1628,13 +1660,14 @@ def main(argv: list[str] | None = None) -> int:
     roots = a.root or (quick_roots() if a.quick else default_roots())
     failures: list[str] = []
     dropped: list[Finding] = []
+    warnings: list[str] = []
     try:
         if not (a.command == "scan" and a.json):
             scope = "quick" if a.quick else ("custom" if a.root else "home")
             print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  "
                   f"{scope} scope, {len(roots)} root(s)...")
         findings = scan(roots, progress=not (a.command == "scan" and a.json),
-                        failures=failures, suppressed=dropped)
+                        failures=failures, suppressed=dropped, warnings=warnings)
     except (RuntimeError, OSError) as e:
         # Every root failed, or the scanner is not installed at all. Say why,
         # rather than printing a traceback.
@@ -1646,13 +1679,14 @@ def main(argv: list[str] | None = None) -> int:
     if a.command == "scan":
         if a.json:
             print(json.dumps({"findings": [g.public() for g in group_findings(findings)],
-                              "suppressed": suppression_summary(dropped)}, indent=1))
+                              "suppressed": suppression_summary(dropped),
+                              "failures": failures, "warnings": warnings}, indent=1))
         else:
-            print_table(findings, failures, dropped)
+            print_table(findings, failures, dropped, warnings)
         return 0
 
     serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures,
-          suppressed=dropped)
+          suppressed=dropped, warnings=warnings)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

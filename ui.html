@@ -227,6 +227,12 @@ function render() {
        A root that failed is not a root that is clean.<div class="locs">${
          state.failures.map(esc).join("<br>")}</div></div>`
     : "";
+  // gitleaks always honours a .gitleaksignore at the top of a scanned folder and
+  // cannot say what it hid, so the file itself is named.
+  const warned = (state.warnings || []).length
+    ? `<div class="note"><b>${state.warnings.length} ignore file${state.warnings.length === 1 ? "" : "s"} hide findings this scan cannot count.</b>
+       <div class="locs">${state.warnings.map(esc).join("<br>")}</div></div>`
+    : "";
   // Every filtered finding, named and revealable. A scan that suppressed
   // everything used to look exactly like a scan that found nothing.
   const sup = state.suppressed || [];
@@ -240,7 +246,7 @@ function render() {
            r.paths.map(esc).join("<br>")}`).join("<br><br>")}</div></details>
        Re-run with <code>--no-filter</code> to scan without them.</div>`
     : "";
-  $("banner").innerHTML = failed + filtered + (committed
+  $("banner").innerHTML = failed + warned + filtered + (committed
     ? `<div class="note"><b>${committed} of these appear in a committed file.</b> Removing the file here does
        not unleak the value. It is in every clone and in the history. Rotate those credentials.
        They are still removable; you just need to know that removing is not enough.</div>`
