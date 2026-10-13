@@ -299,9 +299,10 @@ function render() {
         <td class="rule">${esc(f.rule)}</td>
         <td class="num val">${f.copies}</td>
         <td>${f.tracked ? '<span class="tag committed">committed</span>' : ""}
-            ${f.editable === false
-              ? `<span class="tag rotate" title="${esc(f.locked || "")}">${(f.locked || "").startsWith("terraform") ? "rotate only" : "app data"}</span>`
-              : !f.removable ? '<span class="tag">history</span>' : ""}
+            ${f.locked
+              ? `<span class="tag rotate" title="${esc(f.locked)}">${f.locked.startsWith("terraform") ? "rotate only" : "app data"}${f.editable === false ? "" : ": some copies"}</span>`
+              : ""}
+            ${f.editable !== false && !f.removable ? '<span class="tag">history</span>' : ""}
             ${f.detector === "schema" ? '<span class="tag schema">parsed</span>' : ""}
             ${f.live === "live" ? `<span class="tag live" title="${esc(f.live_detail)}">live</span>`
               : f.live === "revoked" ? `<span class="tag dead" title="${esc(f.live_detail)}">revoked</span>`

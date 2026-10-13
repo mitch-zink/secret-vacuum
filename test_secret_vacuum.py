@@ -1713,6 +1713,23 @@ def test_a_revoked_value_moves_to_the_suppressed_list():
     assert kept == [g] and dropped == [f] and f.suppressed_by == "revoked"
 
 
+def test_one_locked_copy_does_not_lock_the_whole_row(tmp_path: Path):
+    """A key copied into terraform state and into ~/.aws/credentials: the state
+    copy is never edited, the credentials copy still can be, and the outcome
+    names the one that was skipped."""
+    sandbox(tmp_path)
+    state = tmp_path / "terraform.tfstate"
+    state.write_text('{"outputs": {"k": {"value": "%s"}}}\n' % FAKE_AWS_SECRET)
+    creds = tmp_path / "credentials"
+    creds.write_text(f"aws_secret_access_key = {FAKE_AWS_SECRET}\n")
+    a, b = finding(str(state), FAKE_AWS_SECRET), finding(str(creds), FAKE_AWS_SECRET)
+    g = sv.group_findings([a, b])[0]
+    assert g.editable and g.public()["locked"].startswith("terraform")
+    out = act("redact", a, b)["results"][0]
+    assert out["ok"] is False and out["done"] == 1 and "terraform state" in out["detail"]
+    assert FAKE_AWS_SECRET not in creds.read_text() and FAKE_AWS_SECRET in state.read_text()
+
+
 def test_the_plain_runner_sees_every_test():
     """CI runs this file directly. A test defined below the __main__ block is
     invisible to that runner while pytest still finds it."""

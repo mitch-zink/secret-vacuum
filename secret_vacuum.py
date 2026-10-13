@@ -438,19 +438,25 @@ class Group:
     def tracked(self) -> bool:
         return any(m.tracked for m in self.members)
 
+    # One locked copy (terraform state, an app database) must not lock the row:
+    # the action runs on every copy it safely can and names the ones it skipped.
+    @property
+    def _editable(self) -> list[Finding]:
+        return [m for m in self.members if m.editable]
+
     @property
     def removable(self) -> bool:
-        return all(m.removable for m in self.members)
+        return bool(self._editable) and all(m.removable for m in self._editable)
 
     @property
     def editable(self) -> bool:
-        return all(m.editable for m in self.members)
+        return bool(self._editable)
 
     @property
     def suggested(self) -> str:
         if not self.editable:
             return "ignore"
-        return "remove" if all(m.suggested == "remove" for m in self.members) else "redact"
+        return "remove" if all(m.suggested == "remove" for m in self._editable) else "redact"
 
     def public(self) -> dict:
         return {
