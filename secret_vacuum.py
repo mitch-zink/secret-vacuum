@@ -1251,77 +1251,42 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
         if a == "redact" and f.path not in remove and f.fingerprint not in stop:
             by_file.setdefault(f.path, []).append(f)
 
-    for path, group in by_file.items():
-        src = Path(path)
-        if not src.is_file():
-            results += [{"fingerprint": f.fingerprint, "ok": False, "detail": "file is gone"} for f in group]
-            continue
-        lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
-        changed = False
-        mark = len(entries)
-        for f in sorted(group, key=lambda f: -f.start_line):
-            lines, ok = redact_lines(lines, f)
-            results.append({
-                "fingerprint": f.fingerprint, "ok": ok,
-                "detail": "redacted" if ok else "value no longer on that line, left alone",
-            })
-            if ok:
-                changed = True
-                entries.append({"path": path, "action": "redact", "rule": f.rule,
-                                "sha8": f.sha8, "line": f.start_line})
-        # Only touch the file if something actually changed. Stashing regardless
-        # would leave an orphaned copy of the secret in the trash and bump the
-        # mtime of a file we did not edit. The original is still on disk here.
-        if changed:
-            stashed = _stash(batch, src)
-            src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
-            # A line-level replace inside a structured document can leave it
-            # unparseable. Check, and put the original back rather than hand the
-            # user a broken kubeconfig in exchange for a redacted line.
-            broke = _parse_error(src)
-            if broke:
-                shutil.copy2(stashed, src)
-                for r in results[-len(group):]:
-                    r["ok"], r["detail"] = False, f"left alone: editing it broke the file ({broke})"
-                # The rollback un-did every edit to this file, so the manifest must
-                # not keep claiming them: undo would otherwise "restore" a file
-                # that was never changed, over whatever is there by then.
-                del entries[mark:]
-                stashed.unlink(missing_ok=True)
+    try:
+        for path, group in by_file.items():
+            _redact_file(batch, Path(path), group, results, entries)
 
-    moved: set[str] = set()
-    for f, a in chosen:
-        if f.fingerprint in stop:
-            continue
-        if a == "remove":
-            if not f.removable:
-                results.append({"fingerprint": f.fingerprint, "ok": False,
-                                "detail": "history file: redact instead of removing"})
-            elif f.path in moved:
-                # Two secrets in one file: the first move took care of both.
-                results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
-            elif not Path(f.path).exists():
-                results.append({"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"})
-            else:
-                dest = batch / "files" / trash_rel(f.path)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(f.path, dest)  # move, never unlink
-                moved.add(f.path)
-                entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
-                results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
-        elif a == "ignore":
-            add_ignore(f)
-            results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
+        moved: set[str] = set()
+        for f, a in chosen:
+            if f.fingerprint in stop:
+                continue
+            if a == "remove":
+                results.append(_remove_one(batch, f, moved, entries))
+            elif a == "ignore":
+                try:
+                    add_ignore(f)
+                    results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
+                except OSError as e:
+                    results.append({"fingerprint": f.fingerprint, "ok": False,
+                                    "detail": f"could not record the ignore: {e.strerror or e}"})
 
-    # A redaction on a file that was also removed never ran, but the value went with
-    # the file. Say so, rather than leaving that row with no outcome at all.
-    for f, a in chosen:
-        if a == "redact" and f.path in remove and f.fingerprint not in stop:
-            gone = f.path in moved
-            results.append({
-                "fingerprint": f.fingerprint, "ok": gone,
-                "detail": "removed with the file" if gone else "the file could not be removed",
-            })
+        # A redaction on a file that was also removed never ran, but the value went
+        # with the file. Say so, rather than leaving that row with no outcome at all.
+        for f, a in chosen:
+            if a == "redact" and f.path in remove and f.fingerprint not in stop:
+                gone = f.path in moved
+                results.append({
+                    "fingerprint": f.fingerprint, "ok": gone,
+                    "detail": "removed with the file" if gone else "the file could not be removed",
+                })
+    finally:
+        # Written whatever happened above, so a batch on disk always says what it
+        # holds. Paths, rule ids and hashes only: no secret value reaches this file.
+        if batch:
+            (batch / "manifest.json").write_text(json.dumps(
+                {"created": datetime.now(timezone.utc).isoformat(), "entries": entries}, indent=1))
+            if not entries and not any(p.is_file() for p in (batch / "files").rglob("*")):
+                shutil.rmtree(batch, ignore_errors=True)
+                batch = None
 
     rolled: dict[str, dict] = {}
     for r in results:
@@ -1339,16 +1304,87 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
         elif agg["done"]:
             agg["detail"] = f"{agg['done']} done, {agg['failed']} skipped: {agg['detail']}"
     results = list(rolled.values())
-
-    if batch:
-        # Paths, rule ids and hashes only. No secret value reaches this file.
-        (batch / "manifest.json").write_text(
-            json.dumps({"created": datetime.now(timezone.utc).isoformat(), "entries": entries}, indent=1)
-        )
-        if not entries:
-            shutil.rmtree(batch, ignore_errors=True)
-            batch = None
     return {"batch": batch.name if batch else None, "results": results}
+
+
+def _redact_file(batch: Path, src: Path, group: list[Finding], results: list[dict],
+                 entries: list[dict]) -> None:
+    """Every secret in one file, as one edit. A file that cannot be read or
+    written fails on its own: the rest of the batch still runs and reports."""
+    mark, first = len(entries), len(results)
+    stashed, writing = None, False
+    try:
+        if not src.is_file():
+            results += [{"fingerprint": f.fingerprint, "ok": False, "detail": "file is gone"} for f in group]
+            return
+        lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+        changed = False
+        for f in sorted(group, key=lambda f: -f.start_line):
+            lines, ok = redact_lines(lines, f)
+            results.append({
+                "fingerprint": f.fingerprint, "ok": ok,
+                "detail": "redacted" if ok else "value no longer on that line, left alone",
+            })
+            if ok:
+                changed = True
+                entries.append({"path": str(src), "action": "redact", "rule": f.rule,
+                                "sha8": f.sha8, "line": f.start_line})
+        # Only touch the file if something actually changed. Stashing regardless
+        # would leave an orphaned copy of the secret in the trash and bump the
+        # mtime of a file we did not edit. The original is still on disk here.
+        if not changed:
+            return
+        stashed = _stash(batch, src)
+        writing = True
+        src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
+        # A line-level replace inside a structured document can leave it
+        # unparseable. Check, and put the original back rather than hand the
+        # user a broken kubeconfig in exchange for a redacted line.
+        broke = _parse_error(src)
+        if broke:
+            shutil.copy2(stashed, src)
+            for r in results[first:]:
+                r["ok"], r["detail"] = False, f"left alone: editing it broke the file ({broke})"
+            # The rollback un-did every edit to this file, so the manifest must
+            # not keep claiming them: undo would otherwise "restore" a file
+            # that was never changed, over whatever is there by then.
+            del entries[mark:]
+            stashed.unlink(missing_ok=True)
+    except OSError as e:
+        detail = f"could not edit: {e.strerror or e}"
+        restored = not writing
+        if writing and stashed:
+            try:
+                # A write refused at open left the file as it was; one that failed
+                # part way may have truncated it, so put the original back.
+                if src.read_bytes() != stashed.read_bytes():
+                    shutil.copy2(stashed, src)
+                restored = True
+            except OSError:
+                detail += "; undo puts the original back"
+        if stashed and restored:
+            stashed.unlink(missing_ok=True)  # no orphan copy of the secret
+            del entries[mark:]
+        results[first:] = [{"fingerprint": f.fingerprint, "ok": False, "detail": detail} for f in group]
+
+
+def _remove_one(batch: Path, f: Finding, moved: set[str], entries: list[dict]) -> dict:
+    if not f.removable:
+        return {"fingerprint": f.fingerprint, "ok": False, "detail": "history file: redact instead of removing"}
+    if f.path in moved:
+        # Two secrets in one file: the first move took care of both.
+        return {"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"}
+    if not Path(f.path).exists():
+        return {"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"}
+    try:
+        dest = batch / "files" / trash_rel(f.path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(f.path, dest)  # move, never unlink
+    except OSError as e:
+        return {"fingerprint": f.fingerprint, "ok": False, "detail": f"could not move: {e.strerror or e}"}
+    moved.add(f.path)
+    entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
+    return {"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"}
 
 
 def add_ignore(f: Finding) -> None:

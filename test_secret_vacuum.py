@@ -1647,6 +1647,29 @@ def test_private_keys_are_judged_by_structure(tmp_path: Path):
     assert sv.partition([f])[1][0].suppressed_by == "unusable-key"
 
 
+def test_one_unwritable_file_does_not_abort_the_batch(tmp_path: Path):
+    """A read-only file used to raise out of the apply: earlier edits stayed, no
+    manifest was written, nothing was reported, and a backup copy of the secret
+    was left in the trash."""
+    sandbox(tmp_path)
+    ok = tmp_path / "a.env"
+    ok.write_text(f"K={FAKE_STRIPE}\n")
+    ro = tmp_path / "b.json"
+    ro.write_text('{"k": "%s"}\n' % FAKE_AWS_SECRET)
+    ro.chmod(0o444)
+    try:
+        out = act("redact", finding(str(ok), FAKE_STRIPE), finding(str(ro), FAKE_AWS_SECRET))
+    finally:
+        ro.chmod(0o644)
+    assert sorted(r["ok"] for r in out["results"]) == [False, True], "one outcome per secret"
+    assert any("could not edit" in r["detail"] for r in out["results"])
+    assert "removed by secret-vacuum" in ok.read_text() and FAKE_AWS_SECRET in ro.read_text()
+    batch = sv.TRASH / out["batch"]
+    assert (batch / "manifest.json").exists()
+    assert not any(FAKE_AWS_SECRET in p.read_text(errors="ignore")
+                   for p in (batch / "files").rglob("*") if p.is_file()), "no orphan backup"
+
+
 def test_the_plain_runner_sees_every_test():
     """CI runs this file directly. A test defined below the __main__ block is
     invisible to that runner while pytest still finds it."""
