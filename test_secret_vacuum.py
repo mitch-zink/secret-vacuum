@@ -800,14 +800,14 @@ def test_rescan_reasks_git_so_a_committed_badge_cannot_go_stale(tmp_path: Path):
     target = repo / "later.env"
     target.write_text(f"k = {FAKE_STRIPE}\n")
 
-    sv.git_tracked.cache_clear()
+    sv.clear_git_cache()
     assert sv.scan([str(repo)])[0].tracked is False
 
     run("git", "add", "later.env")
     run("git", "commit", "-q", "-m", "committed now")
 
     assert sv.scan([str(repo)])[0].tracked is False, "the cache is why this is stale"
-    sv.git_tracked.cache_clear()  # what /api/rescan now does
+    sv.clear_git_cache()  # what /api/rescan now does
     assert sv.scan([str(repo)])[0].tracked is True
 
 
@@ -1091,7 +1091,7 @@ def test_tracked_files_are_flagged_as_committed(tmp_path: Path):
     run("git", "add", "committed.env")
     run("git", "commit", "-q", "-m", "x")
 
-    sv.git_tracked.cache_clear()
+    sv.clear_git_cache()
     by_name = {Path(f.path).name: f for f in sv.scan([str(repo)])}
     assert by_name["committed.env"].tracked is True
     assert by_name["loose.env"].tracked is False
@@ -1675,7 +1675,7 @@ def main() -> int:
             failed.append(name)
             print(f"  FAIL  {name}\n        {type(e).__name__}: {e}")
         finally:
-            sv.git_tracked.cache_clear()
+            sv.clear_git_cache()
             shutil.rmtree(tmp_path, ignore_errors=True)
     print(f"\n{len(tests) - len(failed)}/{len(tests)} passed")
     return 1 if failed else 0

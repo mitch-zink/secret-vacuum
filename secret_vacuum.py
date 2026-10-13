@@ -269,26 +269,38 @@ SUPPRESSORS = [
 ]
 
 
+@functools.lru_cache(maxsize=32)
+def _lines(path: str) -> tuple[str, ...]:
+    """Each file read once per partition. Capped by --max-target-megabytes, so 32
+    entries bound this at 320 MB, and path-sorted input uses one at a time."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return tuple(fh)
+    except OSError:
+        return ()
+
+
 def line_before(f: Finding, width: int = 60) -> str:
     """The text just before the value on its line, which gitleaks' match omits."""
-    try:
-        with open(f.path, encoding="utf-8", errors="replace") as fh:
-            for n, line in enumerate(fh, 1):
-                if n == f.start_line:
-                    at = line.find(f.secret)
-                    return line[max(0, at - width):at] if at >= 0 else ""
-    except OSError:
-        pass
-    return ""
+    lines = _lines(f.path)
+    line = lines[f.start_line - 1] if 0 < f.start_line <= len(lines) else ""
+    at = line.find(f.secret)
+    return line[max(0, at - width):at] if at >= 0 else ""
 
 
 def partition(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
     """Kept, and dropped-with-a-reason. Nothing leaves without being counted."""
+    hits: dict[int, Suppressor | None] = {}
+    try:
+        # Visited one file at a time so _lines reads each once; returned in input order.
+        for i in sorted(range(len(findings)), key=lambda i: findings[i].path):
+            hits[i] = next((s for s in SUPPRESSORS if s.hides(findings[i])), None)
+    finally:
+        _lines.cache_clear()  # no file contents outlive the call
     kept, dropped = [], []
-    for f in findings:
-        hit = next((s for s in SUPPRESSORS if s.hides(f)), None)
-        if hit:
-            f.suppressed_by, f.suppressed_why = hit.name, hit.reason
+    for i, f in enumerate(findings):
+        if hits[i]:
+            f.suppressed_by, f.suppressed_why = hits[i].name, hits[i].reason
             dropped.append(f)
         else:
             kept.append(f)
@@ -497,16 +509,37 @@ def display_path(path: str) -> str:
 
 
 @functools.lru_cache(maxsize=None)
+def _repo_root(directory: str) -> str:
+    """Nearest enclosing work tree, found by looking for .git (a dir, or a file in
+    a worktree or submodule) rather than starting git once per directory."""
+    d = Path(directory)
+    for p in (d, *d.parents):
+        if (p / ".git").exists():
+            return str(p)
+    return ""
+
+
+@functools.lru_cache(maxsize=None)
+def _tracked_in(repo: str) -> frozenset[str]:
+    r = subprocess.run([_binary("git"), "-C", repo, "ls-files", "-z"], capture_output=True)
+    if r.returncode != 0:
+        return frozenset()
+    return frozenset(os.path.normcase(os.path.normpath(os.path.join(repo, p)))
+                     for p in r.stdout.decode("utf-8", "surrogateescape").split("\0") if p)
+
+
 def git_tracked(path: str) -> bool:
     """True if git has this file committed, which means deleting it here does not
-    unleak it -- the value is in every clone and needs rotating instead."""
-    p = Path(path)
-    r = subprocess.run(
-        [_binary("git"), "-C", str(p.parent), "ls-files", "--error-unmatch", "--", p.name],
-        capture_output=True,
-        text=True,
-    )
-    return r.returncode == 0
+    unleak it -- the value is in every clone and needs rotating instead. One
+    listing per repository: a subprocess per file cost ~19 ms each, ~1,000 times."""
+    repo = _repo_root(str(Path(path).parent))
+    return bool(repo) and os.path.normcase(os.path.normpath(path)) in _tracked_in(repo)
+
+
+def clear_git_cache() -> None:
+    """A file may have been committed since the last scan."""
+    _repo_root.cache_clear()
+    _tracked_in.cache_clear()
 
 
 @functools.lru_cache(maxsize=1)
@@ -937,6 +970,10 @@ def parse_roots(roots: list[Path]) -> list[Finding]:
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
             dirnames[:] = [d for d in dirnames if not is_skipped(f"{dirpath}/{d}/")]
             for fn in filenames:
+                # Cheap first: only a file some parser claims by name is worth
+                # testing against the skip list. That was 82% of the walk's time.
+                if not any(rx.search(fn) for rx, _ in PARSERS):
+                    continue
                 full = Path(dirpath) / fn
                 if not is_skipped(str(full)):
                     out += parse_file(full)
@@ -1556,7 +1593,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, b"forbidden", "text/plain")
         route = urlparse(self.path).path
         if route == "/api/rescan":
-            git_tracked.cache_clear()  # a file may have been committed since the last scan
+            clear_git_cache()
             failures: list[str] = []
             dropped: list[Finding] = []
             warnings: list[str] = []
