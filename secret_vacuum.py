@@ -1784,10 +1784,11 @@ def run_live_verification(findings: list[Finding]) -> list[Finding]:
 
     rules = sorted({f.rule for f in findings if verify.verifiable(f.rule)})
     if not rules:
-        print("  nothing here has a verifier; leaving them as offline checks only")
+        print("  nothing here has a verifier; leaving them as offline checks only", file=sys.stderr)
         return findings
-    print(f"  asking {', '.join(verify.destinations(rules))} whether these still work.")
-    print("  this is a real request with your credential and lands in their audit log.")
+    # stderr, so `scan --json --verify live` still emits clean JSON on stdout.
+    print(f"  asking {', '.join(verify.destinations(rules))} whether these still work.", file=sys.stderr)
+    print("  this is a real request with your credential and lands in their audit log.", file=sys.stderr)
     canaries = verify.load_registry(STATE / "canaries.txt")
     done: dict[str, tuple[str, str]] = {}
     for f in findings:

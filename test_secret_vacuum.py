@@ -1730,6 +1730,26 @@ def test_one_locked_copy_does_not_lock_the_whole_row(tmp_path: Path):
     assert FAKE_AWS_SECRET not in creds.read_text() and FAKE_AWS_SECRET in state.read_text()
 
 
+def test_live_scan_json_stays_clean_and_lists_revoked(tmp_path: Path):
+    """--verify live talks on stderr, so --json on stdout still parses, and a value
+    the issuer rejected moves to the suppressed list."""
+    import verify
+    sandbox(tmp_path)
+    (tmp_path / ".env").write_text(f"STRIPE_KEY={FAKE_STRIPE}\n")
+    real = verify.verify
+    verify.verify = lambda rule, value, **_: ("revoked", "rejected (401)")
+    try:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            sv.main(["scan", "--json", "--verify", "live", "--root", str(tmp_path)])
+    finally:
+        verify.verify = real
+    doc = json.loads(out.getvalue())
+    assert not [f for f in doc["findings"] if f["rule"] == "stripe-access-token"]
+    assert any(r["rule"] == "revoked" for r in doc["suppressed"])
+    assert "audit log" in err.getvalue() and FAKE_STRIPE not in out.getvalue() + err.getvalue()
+
+
 def test_the_plain_runner_sees_every_test():
     """CI runs this file directly. A test defined below the __main__ block is
     invisible to that runner while pytest still finds it."""
