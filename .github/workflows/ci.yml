@@ -10,79 +10,65 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, secret-vacuum]
+    # Public repository: GitHub-hosted runners are free and isolated per job.
     strategy:
+      fail-fast: false
       matrix:
-        python: ["3.10", "3.13"]
+        include:
+          - { os: ubuntu-latest,  python: "3.10", asset: linux_x64.tar.gz }
+          - { os: ubuntu-latest,  python: "3.13", asset: linux_x64.tar.gz }
+          - { os: macos-latest,   python: "3.13", asset: darwin_arm64.tar.gz }
+          - { os: windows-latest, python: "3.13", asset: windows_x64.zip }
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "${{ matrix.python }}" }
-      - name: Install gitleaks
+      - name: Install gitleaks (POSIX)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          export PATH="$RUNNER_TEMP/bin:$PATH"
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_${{ matrix.asset }}" \
             | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
-          gitleaks version
+      - name: Install gitleaks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_${{ matrix.asset }}" -OutFile gitleaks.zip
+          Expand-Archive gitleaks.zip -DestinationPath "$env:RUNNER_TEMP\gl"
+          "$env:RUNNER_TEMP\gl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # %TEMP% is under AppData\Local\Temp, which the scanner skips on purpose,
+          # so fixtures written there would be invisible to the code under test.
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\svt" | Out-Null
+          "TMP=$env:RUNNER_TEMP\svt"    | Out-File $env:GITHUB_ENV -Append
+          "TEMP=$env:RUNNER_TEMP\svt"   | Out-File $env:GITHUB_ENV -Append
+          "TMPDIR=$env:RUNNER_TEMP\svt" | Out-File $env:GITHUB_ENV -Append
+      - run: gitleaks version
       - run: pip install --quiet pytest
       - run: python -m pytest test_secret_vacuum.py -q
       # The no-framework entry point is documented, so it is tested too.
       - run: python test_secret_vacuum.py
 
-  # The delete path builds trash destinations from absolute paths, and a Windows
-  # drive anchor behaves differently enough that reasoning about it is not enough.
-  # Every job runs on a self-hosted runner and there is no Windows one yet, so this
-  # runs only on manual dispatch and waits for a runner labelled `windows`.
-  windows:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, windows]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
-      - name: Install gitleaks
-        shell: pwsh
-        run: |
-          $u = "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_x64.zip"
-          Invoke-WebRequest $u -OutFile gitleaks.zip
-          Expand-Archive gitleaks.zip -DestinationPath "$env:RUNNER_TEMP\\gl"
-          echo "$env:RUNNER_TEMP\\gl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - run: gitleaks version
-      - run: pip install --quiet pytest
-      # The runner's %TEMP% lives under AppData\Local\Temp, which the scanner
-      # deliberately skips, so fixtures written there would be invisible to the
-      # thing under test. Put them somewhere a real scan would look.
-      - shell: pwsh
-        run: |
-          "TMP=$env:RUNNER_TEMP\svt"       | Out-File $env:GITHUB_ENV -Append
-          "TEMP=$env:RUNNER_TEMP\svt"      | Out-File $env:GITHUB_ENV -Append
-          "TMPDIR=$env:RUNNER_TEMP\svt"    | Out-File $env:GITHUB_ENV -Append
-          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\svt" | Out-Null
-      - run: python -m pytest test_secret_vacuum.py -q --basetemp=${{ runner.temp }}/svt/pt
-      - run: python test_secret_vacuum.py
-
   sast:
-    runs-on: [self-hosted, secret-vacuum]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.13" }
       - run: pip install --quiet bandit
       # B404/B603 are inherent: we shell out to gitleaks and git with argument
       # lists and never shell=True. Anything above low severity fails the build.
-      - run: bandit -r secret_vacuum.py --severity-level medium
+      - run: bandit -r secret_vacuum.py verify.py --severity-level medium
 
   scan-self:
     # Scans this repository only. It never points the scanner at the runner's filesystem.
-    runs-on: [self-hosted, secret-vacuum]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       - name: Install gitleaks
         run: |
           mkdir -p "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          export PATH="$RUNNER_TEMP/bin:$PATH"
           curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
             | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
       - name: No secrets in the working tree

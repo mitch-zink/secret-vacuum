@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import base64
 import json
 import shutil
 import subprocess
@@ -30,11 +32,13 @@ FAKE_AWS_SECRET = "hT8vQm2NxL9pRzK4" + "wYcE7bJfA1sD6gU3nV0iZoXq"  # gitleaks:al
 FAKE_STRIPE = "sk_" + "live_" + "4eC39HqLyjWDarjtT1zdp7dc"  # gitleaks:allow
 
 
-def finding(path: str, secret: str, line: int = 1, end: int | None = None) -> sv.Finding:
+def finding(path: str, secret: str, line: int = 1, end: int | None = None,
+            rule: str = "test-rule", match: str = "") -> sv.Finding:
     return sv.Finding(
-        fingerprint=f"{path}:test-rule:{line}",
+        fingerprint=f"{path}:{rule}:{line}",
         path=path,
-        rule="test-rule",
+        rule=rule,
+        match=match,
         description="a test rule",
         start_line=line,
         end_line=end or line,
@@ -56,7 +60,10 @@ def sandbox(tmp_path: Path) -> None:
     sv.IGNORE_FILE = sv.STATE / ".gitleaksignore"
 
 
-# --------------------------------------------------------------- guarantee 1: no value on disk
+def _jwt(**claims) -> str:
+    # built at runtime so this file does not trip its own scanner
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return ".".join([enc({"alg": "HS256", "typ": "JWT"}), enc(claims), "c2lnbmF0dXJlLXZhbHVl"])
 
 
 def test_mask_never_reveals_more_than_eight_characters():
@@ -685,6 +692,7 @@ def test_scan_json_output_is_grouped_and_carries_no_values(tmp_path: Path):
     assert FAKE_STRIPE not in payload
     assert "key" in groups[0] and "paths" in groups[0]
     assert "suppressed" in doc, "the machine surface must report what was filtered too"
+    assert doc["failures"] == [] and doc["warnings"] == []
 
 
 def test_a_non_ascii_token_is_refused_not_a_crash(tmp_path: Path):
@@ -776,6 +784,10 @@ def test_one_bad_root_does_not_discard_the_others(tmp_path: Path):
         found = sv.scan([str(good), str(bad)], failures=failures)
         assert len(found) == 1, "the healthy root's findings survive"
         assert failures and "bad" in failures[0], "the failure is reported to the caller"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = sv.main(["scan", "--json", "--root", str(good), "--root", str(bad)])
+        assert code == 1, "a partial scan is not a clean exit"
+        assert json.loads(out.getvalue())["failures"], "and the machine surface says why"
     finally:
         sv.scan_root = real_root
 
@@ -793,14 +805,14 @@ def test_rescan_reasks_git_so_a_committed_badge_cannot_go_stale(tmp_path: Path):
     target = repo / "later.env"
     target.write_text(f"k = {FAKE_STRIPE}\n")
 
-    sv.git_tracked.cache_clear()
+    sv.clear_git_cache()
     assert sv.scan([str(repo)])[0].tracked is False
 
     run("git", "add", "later.env")
     run("git", "commit", "-q", "-m", "committed now")
 
     assert sv.scan([str(repo)])[0].tracked is False, "the cache is why this is stale"
-    sv.git_tracked.cache_clear()  # what /api/rescan now does
+    sv.clear_git_cache()  # what /api/rescan now does
     assert sv.scan([str(repo)])[0].tracked is True
 
 
@@ -1084,7 +1096,7 @@ def test_tracked_files_are_flagged_as_committed(tmp_path: Path):
     run("git", "add", "committed.env")
     run("git", "commit", "-q", "-m", "x")
 
-    sv.git_tracked.cache_clear()
+    sv.clear_git_cache()
     by_name = {Path(f.path).name: f for f in sv.scan([str(repo)])}
     assert by_name["committed.env"].tracked is True
     assert by_name["loose.env"].tracked is False
@@ -1142,6 +1154,12 @@ def test_a_filesystem_error_in_a_route_answers_the_request():
     Stub()._guard(boom)
     assert sent["code"] == 500, sent
     assert "PermissionError" in sent["payload"]["error"], sent
+
+    def bad_value():
+        raise ValueError("not an OSError")
+
+    Stub()._guard(bad_value)
+    assert sent["code"] == 500 and "ValueError" in sent["payload"]["error"], sent
 
 
 def test_an_unexpected_report_shape_is_a_scan_failure(tmp_path: Path):
@@ -1584,6 +1602,167 @@ def test_the_two_detectors_agree_on_what_one_file_is_called(tmp_path: Path):
     assert sv.norm_path(mixed) == sv.norm_path(str(env))
 
 
+def test_a_gitleaksignore_in_the_working_directory_hides_nothing(tmp_path: Path):
+    sandbox(tmp_path)  # no ~/.secret-vacuum/.gitleaksignore yet
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "app.sh").write_text(f"export STRIPE={FAKE_STRIPE}\n")
+    first = sv.scan([str(tree)])
+    assert first, "precondition: the planted value is found"
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / ".gitleaksignore").write_text("\n".join(f.fingerprint for f in first) + "\n")
+    old = os.getcwd()
+    os.chdir(cwd)
+    try:
+        assert sv.scan([str(tree)]), "a stray ignore file in the cwd must not hide findings"
+    finally:
+        os.chdir(old)
+
+
+def test_a_root_level_gitleaksignore_is_reported(tmp_path: Path):
+    sandbox(tmp_path)
+    (tmp_path / ".gitleaksignore").write_text("# comment\na:b:1\nc:d:2\n")
+    (tmp_path / "x.txt").write_text("nothing here\n")
+    warnings: list[str] = []
+    sv.scan([str(tmp_path)], warnings=warnings)
+    assert len(warnings) == 1 and "2 entries" in warnings[0]
+
+
+def test_an_escaped_jwt_is_judged_by_its_claims(tmp_path: Path):
+    """A JWT at the end of a JSON-escaped string arrives with the escape's
+    backslash; it must still be read, and an expired one dropped."""
+    sandbox(tmp_path)
+    token = _jwt(sub="a", exp=1600000000)
+    (tmp_path / "state.json").write_text('{"blob": "{\\"token\\":\\"' + token + '\\"}"}\n')
+    dropped: list[sv.Finding] = []
+    kept = sv.scan([str(tmp_path)], suppressed=dropped)
+    assert not [f for f in kept if f.rule == "jwt"]
+    assert any(f.suppressed_by == "expired-jwt" and f.secret == token for f in dropped)
+
+
+def test_private_keys_are_judged_by_structure(tmp_path: Path):
+    """A whole key is reported; its truncated copy, the shape of a test fixture
+    or a broken paste, is not a usable credential."""
+    if not shutil.which("ssh-keygen"):
+        return  # present on every CI image; skip quietly elsewhere
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key), "-C", "t"],
+                   check=True, capture_output=True)
+    pem = key.read_text()
+    lines = pem.strip().splitlines()
+    assert sv.offline_check(pem)[0] == "live-shape"
+    assert sv.offline_check("\\n".join(lines))[0] == "live-shape", "JSON-escaped copy"
+    assert sv.offline_check("\n".join(lines[:2] + lines[-1:]))[0] == "malformed"
+    f = finding(str(key), "\n".join(lines[:2] + lines[-1:]), rule="private-key")
+    assert sv.partition([f])[1][0].suppressed_by == "unusable-key"
+
+
+def test_one_unwritable_file_does_not_abort_the_batch(tmp_path: Path):
+    """A read-only file used to raise out of the apply: earlier edits stayed, no
+    manifest was written, nothing was reported, and a backup copy of the secret
+    was left in the trash."""
+    sandbox(tmp_path)
+    ok = tmp_path / "a.env"
+    ok.write_text(f"K={FAKE_STRIPE}\n")
+    ro = tmp_path / "b.json"
+    ro.write_text('{"k": "%s"}\n' % FAKE_AWS_SECRET)
+    ro.chmod(0o444)
+    try:
+        out = act("redact", finding(str(ok), FAKE_STRIPE), finding(str(ro), FAKE_AWS_SECRET))
+    finally:
+        ro.chmod(0o644)
+    assert sorted(r["ok"] for r in out["results"]) == [False, True], "one outcome per secret"
+    assert any("could not edit" in r["detail"] for r in out["results"])
+    assert "removed by secret-vacuum" in ok.read_text() and FAKE_AWS_SECRET in ro.read_text()
+    batch = sv.TRASH / out["batch"]
+    assert (batch / "manifest.json").exists()
+    assert not any(FAKE_AWS_SECRET in p.read_text(errors="ignore")
+                   for p in (batch / "files").rglob("*") if p.is_file()), "no orphan backup"
+
+
+def test_a_slack_webhook_is_checked_without_posting_anything():
+    """The check sends a body that is not JSON, so a live hook refuses it and posts
+    nothing. Slack's answer separates a live hook from a dead one."""
+    import verify
+    hook = "https://hooks.slack.com/services/" + "T0000/B0000/" + "x" * 24
+    sent = []
+
+    def answering(code, body):
+        def opener(req, timeout=0):
+            sent.append(req)
+            raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(body))
+        return opener
+
+    assert verify.verify("slack-webhook-url", hook, opener=answering(400, b"invalid_payload"))[0] == "live"
+    assert verify.verify("slack-webhook-url", hook, opener=answering(404, b"no_team"))[0] == "revoked"
+    assert verify.verify("slack-webhook-url", hook, opener=answering(400, b"invalid_token"))[0] == "revoked"
+    assert verify.verify("slack-webhook-url", hook, opener=answering(429, b""))[0] == "unknown"
+    assert all(r.data and not r.data.startswith(b"{") for r in sent), "never a postable payload"
+    n = len(sent)
+    assert verify.verify("slack-webhook-url", "https://evil.example/services/x",
+                         opener=answering(400, b"invalid_payload"))[0] == "unknown"
+    assert len(sent) == n, "a URL outside the pinned prefix is never contacted"
+
+
+def test_a_revoked_value_moves_to_the_suppressed_list():
+    f = finding("/x/.env", FAKE_STRIPE)
+    g = finding("/x/.env", FAKE_AWS_SECRET, line=2)
+    dropped: list[sv.Finding] = []
+    kept = sv.apply_live([f, g], dropped, {f.digest: ("revoked", "rejected (401)")})
+    assert kept == [g] and dropped == [f] and f.suppressed_by == "revoked"
+
+
+def test_one_locked_copy_does_not_lock_the_whole_row(tmp_path: Path):
+    """A key copied into terraform state and into ~/.aws/credentials: the state
+    copy is never edited, the credentials copy still can be, and the outcome
+    names the one that was skipped."""
+    sandbox(tmp_path)
+    state = tmp_path / "terraform.tfstate"
+    state.write_text('{"outputs": {"k": {"value": "%s"}}}\n' % FAKE_AWS_SECRET)
+    creds = tmp_path / "credentials"
+    creds.write_text(f"aws_secret_access_key = {FAKE_AWS_SECRET}\n")
+    a, b = finding(str(state), FAKE_AWS_SECRET), finding(str(creds), FAKE_AWS_SECRET)
+    g = sv.group_findings([a, b])[0]
+    assert g.editable and g.public()["locked"].startswith("terraform")
+    out = act("redact", a, b)["results"][0]
+    assert out["ok"] is False and out["done"] == 1 and "terraform state" in out["detail"]
+    assert FAKE_AWS_SECRET not in creds.read_text() and FAKE_AWS_SECRET in state.read_text()
+
+
+def test_live_scan_json_stays_clean_and_lists_revoked(tmp_path: Path):
+    """--verify live talks on stderr, so --json on stdout still parses, and a value
+    the issuer rejected moves to the suppressed list."""
+    import verify
+    sandbox(tmp_path)
+    (tmp_path / ".env").write_text(f"STRIPE_KEY={FAKE_STRIPE}\n")
+    real = verify.verify
+    verify.verify = lambda rule, value, **_: ("revoked", "rejected (401)")
+    try:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            sv.main(["scan", "--json", "--verify", "live", "--root", str(tmp_path)])
+    finally:
+        verify.verify = real
+    doc = json.loads(out.getvalue())
+    assert not [f for f in doc["findings"] if f["rule"] == "stripe-access-token"]
+    assert any(r["rule"] == "revoked" for r in doc["suppressed"])
+    assert "audit log" in err.getvalue() and FAKE_STRIPE not in out.getvalue() + err.getvalue()
+
+
+def test_the_plain_runner_sees_every_test():
+    """CI runs this file directly. A test defined below the __main__ block is
+    invisible to that runner while pytest still finds it."""
+    import ast
+    last = ast.parse(Path(__file__).read_text(encoding="utf-8")).body[-1]
+    assert isinstance(last, ast.If) and "__main__" in ast.unparse(last.test)
+
+
+def test_typed_secrets_in_session_logs_are_kept():
+    f = finding("/u/.claude/projects/x/s.jsonl", "sk-" + "a1B2" * 12, rule="openai-api-key")
+    assert sv.partition([f])[0] == [f]
+
+
 # --------------------------------------------------------------- runner
 
 
@@ -1599,10 +1778,90 @@ def main() -> int:
             failed.append(name)
             print(f"  FAIL  {name}\n        {type(e).__name__}: {e}")
         finally:
-            sv.git_tracked.cache_clear()
+            sv.clear_git_cache()
             shutil.rmtree(tmp_path, ignore_errors=True)
     print(f"\n{len(tests) - len(failed)}/{len(tests)} passed")
     return 1 if failed else 0
+
+
+
+
+def test_findings_nobody_could_use_are_suppressed_and_named(tmp_path: Path):
+    """Reviewing a real scan, half the list could not be used by anyone who stole
+    it: expired tokens, Supabase's public anon key, git SHAs matched by a token
+    rule, request ids. Each is dropped with a named reason, never silently."""
+    far, past = 4102444800, 1600000000
+    cache = tmp_path / "cache.json"
+    cache.write_text('{"path":"p","reviewed_commit":"' + "0123abcd" * 5 + '"}\n')
+    meta = tmp_path / "t.jsonl"
+    meta.write_text('{"gitBranch":"HEAD","slug":"Zm9vYmFyYmF6cXV4"}\n')
+    blob = tmp_path / "b.jsonl"
+    blob.write_text("A1b2" * 40 + "Zm9vYmFyYmF6cXV4\n")
+    mutex = tmp_path / "resources.json"
+    mutex.write_text('{"mutex_key":"Zm9vYmFyYmF6cXV4"}\n')
+    sts = tmp_path / "sts.txt"
+    sts.write_text("ASIA" + "Q" * 16 + "\n")
+    old = time.time() - 40 * 3600
+    os.utime(sts, (old, old))
+    cases = {
+        "app-data": finding("/u/Library/Application Support/Comet/Default/Local Storage/leveldb/000003.log",
+                            FAKE_STRIPE, rule="stripe-access-token"),
+        "expired-aws-session": finding(str(sts), "ASIA" + "Q" * 16, rule="aws-access-token"),
+        "generic-in-text": finding("/u/proj/logs/run.log", "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
+        "session-log": finding("/u/.claude/projects/x/s.jsonl", "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
+        "embedded-blob": finding(str(blob), "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
+        "expired-jwt": finding("/x/auth.json", _jwt(exp=past)),
+        "public-jwt": finding("/x/app.env", _jwt(role="anon", exp=far)),
+        "public-env": finding("/x/.env", "pk" + "abcdef0123456789xyz", rule="generic-api-key",
+                              match="VITE_SUPABASE_ANON_KEY=x"),
+        "git-sha": finding(str(cache), "0123abcd" * 5, rule="sourcegraph-access-token"),
+        "not-a-credential": finding(str(meta), "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
+        "publishable-key": finding("/x/.env", "sb_publishable_" + "abcdef0123456789"),
+        "example-file": finding("/x/.env.example", "acct" + "12345678", rule="generic-api-key"),
+    }
+    kept, dropped = sv.partition(list(cases.values()))
+    assert not kept, [f.path for f in kept]
+    assert {f.suppressed_by for f in dropped} == set(cases)
+    # an identifier or hash under a key-like name is not a credential either
+    hashed = finding(str(mutex), "Zm9vYmFyYmF6cXV4", rule="generic-api-key")
+    assert sv.partition([hashed])[1][0].suppressed_by == "not-a-credential"
+
+
+def test_a_jwt_that_still_grants_access_is_kept(tmp_path: Path):
+    """A Supabase service_role key is a JWT too, and the most dangerous thing in
+    the repo. Being a JWT is never the reason to drop one."""
+    svc = finding("/x/.env", _jwt(role="service_role", iss="supabase", exp=4102444800))
+    noexp = finding("/x/.env", _jwt(role="USER", scope="MCP"))
+    notes = tmp_path / "notes"
+    notes.write_text("token: " + "0123abcd" * 5 + "\n")
+    sha_in_prose = finding(str(notes), "0123abcd" * 5, rule="sourcegraph-access-token")
+    fresh = tmp_path / "fresh.txt"
+    fresh.write_text("ASIA" + "Q" * 16 + "\n")  # touched now: may still be live
+    sts_new = finding(str(fresh), "ASIA" + "Q" * 16, rule="aws-access-token")
+    stale = tmp_path / "stale.txt"
+    stale.write_text(FAKE_AWS_ID + "\n")
+    os.utime(stale, (time.time() - 90 * 86400,) * 2)
+    akia_old = finding(str(stale), FAKE_AWS_ID, rule="aws-access-token")  # long-lived key
+    typed_in_log = finding("/u/proj/logs/run.log", "ghp_" + "a1B2" * 9, rule="github-pat")
+    project_db = finding("/u/Documents/proj/databases/.env", "Zm9vYmFyYmF6cXV4", rule="generic-api-key")
+    keep = [svc, noexp, sha_in_prose, sts_new, akia_old, typed_in_log, project_db]
+    kept, _ = sv.partition(keep)
+    assert kept == keep
+
+
+def test_app_data_is_never_edited(tmp_path: Path):
+    """An app's own database is reported, never edited: a line replace inside
+    LevelDB corrupts the profile, and signing out is the real fix."""
+    sandbox(tmp_path)
+    store = tmp_path / "Library/Application Support/Chrome/Default/Local Storage/leveldb/000003.log"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"\x00\x01key=" + FAKE_STRIPE.encode() + b"\x02\n")
+    before = store.read_bytes()
+    f = finding(str(store), FAKE_STRIPE, rule="stripe-access-token")
+    assert f.editable is False and f.suggested == "ignore"
+    out = act("redact", f)
+    assert out["results"][0]["ok"] is False and "sign out" in out["results"][0]["detail"]
+    assert store.read_bytes() == before
 
 
 if __name__ == "__main__":

@@ -22,8 +22,6 @@ import json
 import urllib.error
 import urllib.request
 
-MODES = ("never", "offline", "readonly", "all")
-
 # rule id -> (host, url, header template). The host is pinned: a verifier may only
 # ever talk to the service that issued the credential it is checking.
 VERIFIERS: dict[str, tuple[str, str, dict]] = {
@@ -39,6 +37,8 @@ VERIFIERS: dict[str, tuple[str, str, dict]] = {
                        {"Authorization": "Bearer {v}"}),
     "anthropic-api-key": ("api.anthropic.com", "https://api.anthropic.com/v1/models",
                           {"x-api-key": "{v}", "anthropic-version": "2023-06-01"}),
+    # The URL is the credential, so this entry pins the prefix it must start with.
+    "slack-webhook-url": ("hooks.slack.com", "https://hooks.slack.com/services/", {}),
 }
 
 # Canaries exist so that any use raises an alarm, which makes verifying one the
@@ -85,6 +85,8 @@ def verify(rule: str, value: str, opener=None, timeout: int = 6) -> tuple[str, s
     a proxy says nothing at all about the credential."""
     if rule not in VERIFIERS:
         return "unknown", "no verifier for this credential type"
+    if rule == "slack-webhook-url":
+        return _verify_slack_webhook(value, opener or urllib.request.urlopen, timeout)
     host, url, headers = VERIFIERS[rule]
     req = urllib.request.Request(url, headers={k: v.format(v=value) for k, v in headers.items()})
     send = opener or urllib.request.urlopen
@@ -102,3 +104,25 @@ def verify(rule: str, value: str, opener=None, timeout: int = 6) -> tuple[str, s
         return "unknown", f"{host} answered {e.code}"
     except Exception as e:  # noqa: BLE001 - DNS, TLS, proxy, offline: all inconclusive
         return "unknown", f"could not reach {host}: {type(e).__name__}"
+
+
+def _verify_slack_webhook(value: str, send, timeout: int) -> tuple[str, str]:
+    """TruffleHog's method: POST a body that is deliberately not JSON. A live hook
+    answers 400 invalid_payload and posts nothing; a dead one answers
+    invalid_token, 403 or 404."""
+    if not value.startswith(VERIFIERS["slack-webhook-url"][1]):
+        return "unknown", "not a hooks.slack.com webhook URL"
+    req = urllib.request.Request(value, data=b"secret-vacuum liveness check, deliberately not JSON",
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with send(req, timeout=timeout) as r:
+            return "live", f"hooks.slack.com accepted it ({r.status})"
+    except urllib.error.HTTPError as e:
+        body = (e.read(200) or b"").decode("utf-8", "replace").strip()
+        if e.code == 400 and body == "invalid_payload":
+            return "live", "hooks.slack.com: the webhook exists (invalid_payload)"
+        if (e.code == 400 and "invalid_token" in body) or e.code in (403, 404):
+            return "revoked", f"hooks.slack.com rejected it ({e.code} {body[:40]})"
+        return "unknown", f"hooks.slack.com answered {e.code}"
+    except Exception as e:  # noqa: BLE001 - DNS, TLS, proxy, offline: all inconclusive
+        return "unknown", f"could not reach hooks.slack.com: {type(e).__name__}"

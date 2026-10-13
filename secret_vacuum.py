@@ -23,11 +23,13 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import webbrowser
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -91,8 +93,6 @@ def default_roots() -> list[str]:
     return [str(Path.home())]
 
 
-# Rewriting shell history is its own kind of damage, so history files are
-# shown and redactable but never removable as a whole file.
 def norm_path(path: str) -> str:
     """One spelling per file, whichever detector found it.
 
@@ -109,6 +109,8 @@ def base_name(path: str) -> str:
     return re.split(r"[\\/]", str(path))[-1]
 
 
+# Rewriting shell history is its own kind of damage, so history files are
+# shown and redactable but never removable as a whole file.
 # Matched on the file name: the old suffix test looked for "/.bash_history",
 # which no Windows path contains, so the guard quietly did nothing there.
 REDACT_ONLY = frozenset({
@@ -124,6 +126,37 @@ ACTIONS = ("remove", "redact", "ignore")
 # the next apply destroys and recreates. Deleting the file is worse. So they are
 # reported, and the only honest action is to rotate the credential upstream.
 ROTATE_ONLY = re.compile(r"\.tfstate(\.backup)?$", re.IGNORECASE)
+
+# Inside an app's own profile store. Editing these files in place corrupts the
+# app's database, and the values are the app's sessions: signing out or clearing
+# the app's data is the fix, not this tool. Scoped to app-data roots so a project
+# folder that happens to be called "databases" is not caught.
+APP_DATA = re.compile(
+    r"(?i)(Library/Application Support|AppData/(Local|Roaming)|\.config)/.+/"
+    r"(IndexedDB|Local Storage|Session Storage|Local Extension Settings|Sync Extension Settings"
+    r"|Extension State|File System|shared_proto_db|databases|blob_storage|GCM Store|Sessions"
+    r"|Service Worker|Sync Data|leveldb)/"
+    r"|(Library/Application Support|AppData/(Local|Roaming)|\.config)/.+/"
+    r"(Preferences|Secure Preferences|Local State|Cookies|Login Data|Web Data"
+    r"|BrowsingTopicsState|TransportSecurity)$"
+    r"|/Library/Preferences/[^/]+\.plist$")
+
+
+def lock_reason(path: str) -> str:
+    """Why no edit is safe here, or "" when one is."""
+    if ROTATE_ONLY.search(base_name(path)):
+        return "terraform state: rotate the credential, editing state corrupts it"
+    if APP_DATA.search(str(path).replace("\\", "/")):
+        return "an app's own database: sign out of the app or clear its data instead"
+    return ""
+
+
+def _older_than(path: str, seconds: float) -> bool:
+    try:
+        return datetime.now(timezone.utc).timestamp() - os.path.getmtime(path) > seconds
+    except OSError:
+        return False
+
 
 # Formats where a successful write still has to produce a parseable document.
 STRUCTURED = {
@@ -148,14 +181,26 @@ class Suppressor:
 
     name: str
     reason: str
-    pattern: re.Pattern
+    pattern: re.Pattern | None = None
     target: str = "secret"  # "secret" or "match" (the surrounding text gitleaks matched)
     generic_only: bool = False
+    check: Callable[[Finding], bool] | None = None  # for what a regex cannot see
 
     def hides(self, f: Finding) -> bool:
         if self.generic_only and "generic" not in f.rule:
             return False
+        if self.check:
+            return self.check(f)
         return bool(self.pattern.search(f.secret if self.target == "secret" else f.match))
+
+
+NOT_A_CREDENTIAL = re.compile(
+    r"(?i)(request[-_]?id|page[-_]?token|next[-_]?token|cursor|etag|correlation[-_]?id|trace[-_]?id"
+    r"|idempotency[-_]?key|token[ _]prefix|gitBranch|slug"
+    # hashes and identifiers that sit under key-like names
+    r"|mutex[-_]?key|metric[-_]?key|enabled[-_]?key|event[-_]?key|variable[-_]?key"
+    r"|activity[-_]?item[-_]?key|crash[-_]?reporter[-_]?key|[A-Za-z_]*id"
+    r")[\"']?\s*[:=]\s*[\"']?$")
 
 
 SUPPRESSORS = [
@@ -178,16 +223,85 @@ SUPPRESSORS = [
     Suppressor("presigned-url", "an expiring S3 signature, not a stored credential",
                re.compile(r"X-Amz-(Signature|Credential)="), target="match",
                generic_only=True),
+    # A JWT is judged by what it grants, not by being a JWT. Expired ones grant
+    # nothing; anon-role ones (Supabase's client key) ship to every browser. A
+    # service_role key is also a JWT, unexpired and not anon, so it stays.
+    Suppressor("expired-jwt", "an expired token grants nothing",
+               check=lambda f: offline_check(f.secret)[0] == "expired"),
+    Suppressor("public-jwt", "a client-side key (role anon), public by design",
+               check=lambda f: (jwt_claims(f.secret) or {}).get("role") == "anon"),
+    Suppressor("publishable-key", "a publishable key, meant to ship in client code",
+               re.compile(r"^(sb_publishable_|pk_(live|test)_)")),
+    Suppressor("public-env", "a build-time public variable, shipped to every browser",
+               re.compile(r"(?i)\b(VITE|NEXT_PUBLIC|NUXT_PUBLIC|EXPO_PUBLIC|REACT_APP|GATSBY)_\w*\s*[=:]"),
+               target="match", generic_only=True),
+    # Typed rules too: sourcegraph's legacy token is bare 40-hex, so every git SHA
+    # in a JSON cache matched it. gitleaks' match stops at the value, so the key
+    # name is read off the line itself.
+    Suppressor("git-sha", "a commit hash, not a credential", check=lambda f:
+               bool(re.fullmatch(r"[0-9a-f]{40}", f.secret)) and bool(re.search(
+                   r"(?i)(sha|commit|revision|rev|hash|checksum)\w*[\"']?\s*[:=]\s*[\"']?$",
+                   line_before(f)))),
+    Suppressor("not-a-credential", "a request id, session slug, identifier or hash under a key-like name",
+               check=lambda f: "generic" in f.rule and bool(NOT_A_CREDENTIAL.search(line_before(f)))),
+    Suppressor("embedded-blob", "a slice of a long base64 blob, such as an embedded image",
+               check=lambda f: "generic" in f.rule and bool(re.fullmatch(r"[A-Za-z0-9+/]{60}", line_before(f)))),
+    Suppressor("session-log", "generic match in an AI session log or skill doc, mostly prose and tool output; typed rules still report",
+               check=lambda f: "generic" in f.rule and bool(re.search(
+                   r"(?i)/\.(claude|cursor)/(projects|file-history|paste-cache|todos|skills|plans)/",
+                   f.path.replace("\\", "/")))),
+    # No row inside an app's own database is actionable here, typed or not.
+    Suppressor("app-data", "inside an app's own database; sign out of the app to clear it",
+               check=lambda f: bool(APP_DATA.search(f.path.replace("\\", "/")))),
+    # ASIA ids are STS temporary credentials (IAM unique-ID prefixes). The longest
+    # any STS call can issue is 36 hours, so one in a file untouched for longer
+    # than that has expired, whatever it was.
+    Suppressor("expired-aws-session", "a temporary AWS key in a file older than its 36-hour maximum life",
+               check=lambda f: f.secret.startswith("ASIA") and _older_than(f.path, 36 * 3600)),
+    Suppressor("generic-in-text", "generic match in a log, document or data export; typed rules still report",
+               check=lambda f: "generic" in f.rule and bool(re.search(
+                   r"(?i)(\.log(\.\d+)?$|(^|/|_)logs?/|/Logs/|\.(md|mdx|rst|adoc|html?|liquid|jsonl|ndjson|csv|tsv)$)",
+                   f.path.replace("\\", "/")))),
+    Suppressor("unusable-key", "a private-key block that does not decode to a whole key",
+               check=lambda f: f.rule == "private-key" and f.state[0] == "malformed"),
+    Suppressor("example-file", "a template file, its values are samples",
+               check=lambda f: ("generic" in f.rule or f.rule == "credential-file-assignment")
+               and bool(re.search(r"(?i)\.(example|sample|template|dist)$", base_name(f.path)))),
 ]
+
+
+@functools.lru_cache(maxsize=32)
+def _lines(path: str) -> tuple[str, ...]:
+    """Each file read once per partition. Capped by --max-target-megabytes, so 32
+    entries bound this at 320 MB, and path-sorted input uses one at a time."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return tuple(fh)
+    except OSError:
+        return ()
+
+
+def line_before(f: Finding, width: int = 60) -> str:
+    """The text just before the value on its line, which gitleaks' match omits."""
+    lines = _lines(f.path)
+    line = lines[f.start_line - 1] if 0 < f.start_line <= len(lines) else ""
+    at = line.find(f.secret)
+    return line[max(0, at - width):at] if at >= 0 else ""
 
 
 def partition(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
     """Kept, and dropped-with-a-reason. Nothing leaves without being counted."""
+    hits: dict[int, Suppressor | None] = {}
+    try:
+        # Visited one file at a time so _lines reads each once; returned in input order.
+        for i in sorted(range(len(findings)), key=lambda i: findings[i].path):
+            hits[i] = next((s for s in SUPPRESSORS if s.hides(findings[i])), None)
+    finally:
+        _lines.cache_clear()  # no file contents outlive the call
     kept, dropped = [], []
-    for f in findings:
-        hit = next((s for s in SUPPRESSORS if s.hides(f)), None)
-        if hit:
-            f.suppressed_by, f.suppressed_why = hit.name, hit.reason
+    for i, f in enumerate(findings):
+        if hits[i]:
+            f.suppressed_by, f.suppressed_why = hits[i].name, hits[i].reason
             dropped.append(f)
         else:
             kept.append(f)
@@ -197,11 +311,6 @@ def partition(findings: list[Finding]) -> tuple[list[Finding], list[Finding]]:
 # both take this for their whole body, so the guarantee holds for any caller and
 # not just for the request handler.
 MUTATE = threading.Lock()
-
-# Roots the last scan could not read. Surfaced in the CLI and in the UI, because a
-# root that failed is not a root that is clean.
-
-
 
 def _binary(name: str) -> str:
     """Resolve once, absolutely. A security tool should not let PATH decide which
@@ -280,7 +389,7 @@ class Finding:
     @property
     def editable(self) -> bool:
         """False where any edit is worse than the leak it removes."""
-        return not ROTATE_ONLY.search(base_name(self.path))
+        return not lock_reason(self.path)
 
     @property
     def state(self) -> tuple[str, str]:
@@ -303,6 +412,7 @@ class Finding:
             "tracked": self.tracked,
             "removable": self.removable,
             "editable": self.editable,
+            "locked": lock_reason(self.path),
             "suggested": self.suggested,
             "detector": self.detector,
             "state": self.state[0],
@@ -329,19 +439,25 @@ class Group:
     def tracked(self) -> bool:
         return any(m.tracked for m in self.members)
 
+    # One locked copy (terraform state, an app database) must not lock the row:
+    # the action runs on every copy it safely can and names the ones it skipped.
+    @property
+    def _editable(self) -> list[Finding]:
+        return [m for m in self.members if m.editable]
+
     @property
     def removable(self) -> bool:
-        return all(m.removable for m in self.members)
+        return bool(self._editable) and all(m.removable for m in self._editable)
 
     @property
     def editable(self) -> bool:
-        return all(m.editable for m in self.members)
+        return bool(self._editable)
 
     @property
     def suggested(self) -> str:
         if not self.editable:
             return "ignore"
-        return "remove" if all(m.suggested == "remove" for m in self.members) else "redact"
+        return "remove" if all(m.suggested == "remove" for m in self._editable) else "redact"
 
     def public(self) -> dict:
         return {
@@ -361,6 +477,7 @@ class Group:
             "tracked_copies": sum(m.tracked for m in self.members),
             "removable": self.removable,
             "editable": self.editable,
+            "locked": next((r for m in self.members if (r := lock_reason(m.path))), ""),
             "suggested": self.suggested,
             "detector": "schema" if any(m.detector == "schema" for m in self.members) else "pattern",
             "state": self.lead.state[0],
@@ -399,16 +516,37 @@ def display_path(path: str) -> str:
 
 
 @functools.lru_cache(maxsize=None)
+def _repo_root(directory: str) -> str:
+    """Nearest enclosing work tree, found by looking for .git (a dir, or a file in
+    a worktree or submodule) rather than starting git once per directory."""
+    d = Path(directory)
+    for p in (d, *d.parents):
+        if (p / ".git").exists():
+            return str(p)
+    return ""
+
+
+@functools.lru_cache(maxsize=None)
+def _tracked_in(repo: str) -> frozenset[str]:
+    r = subprocess.run([_binary("git"), "-C", repo, "ls-files", "-z"], capture_output=True)
+    if r.returncode != 0:
+        return frozenset()
+    return frozenset(os.path.normcase(os.path.normpath(os.path.join(repo, p)))
+                     for p in r.stdout.decode("utf-8", "surrogateescape").split("\0") if p)
+
+
 def git_tracked(path: str) -> bool:
     """True if git has this file committed, which means deleting it here does not
-    unleak it -- the value is in every clone and needs rotating instead."""
-    p = Path(path)
-    r = subprocess.run(
-        [_binary("git"), "-C", str(p.parent), "ls-files", "--error-unmatch", "--", p.name],
-        capture_output=True,
-        text=True,
-    )
-    return r.returncode == 0
+    unleak it -- the value is in every clone and needs rotating instead. One
+    listing per repository: a subprocess per file cost ~19 ms each, ~1,000 times."""
+    repo = _repo_root(str(Path(path).parent))
+    return bool(repo) and os.path.normcase(os.path.normpath(path)) in _tracked_in(repo)
+
+
+def clear_git_cache() -> None:
+    """A file may have been committed since the last scan."""
+    _repo_root.cache_clear()
+    _tracked_in.cache_clear()
 
 
 @functools.lru_cache(maxsize=1)
@@ -432,8 +570,9 @@ def scan_root(root: Path) -> list[dict]:
         # allowlist away its leaks behind our back.
         "--config", str(CONFIG_FILE),
     ]
-    if IGNORE_FILE.exists():
-        cmd += ["--gitleaks-ignore-path", str(IGNORE_FILE)]
+    # Pinned so gitleaks never falls back to "." and honours a .gitleaksignore in
+    # whatever directory the user happened to run us from.
+    cmd += ["--gitleaks-ignore-path", str(IGNORE_FILE) if IGNORE_FILE.exists() else os.devnull]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     except OSError as e:
@@ -464,9 +603,25 @@ def scan_root(root: Path) -> list[dict]:
     return hits
 
 
+def root_ignore_warnings(roots: list[Path]) -> list[str]:
+    """gitleaks applies a .gitleaksignore at the top of each scanned directory and
+    offers no way to turn that off, so the findings it hides cannot be counted.
+    The least we can do is say the file is there."""
+    out = []
+    for root in roots:
+        f = root / ".gitleaksignore"
+        if root.is_dir() and f.is_file():
+            n = sum(1 for ln in f.read_text(errors="replace").splitlines()
+                    if ln.strip() and not ln.startswith("#"))
+            out.append(f"{display_path(str(f))}: gitleaks applies its {n} entr"
+                       f"{'y' if n == 1 else 'ies'} and the findings they hide are not counted")
+    return out
+
+
 def scan(roots: list[str], progress: bool = False,
          failures: list[str] | None = None,
-         suppressed: list[Finding] | None = None) -> list[Finding]:
+         suppressed: list[Finding] | None = None,
+         warnings: list[str] | None = None) -> list[Finding]:
     """A first run over a developer's whole code directory takes minutes, so say
     what is happening rather than looking hung."""
     wanted = [Path(r).expanduser() for r in roots]
@@ -480,7 +635,9 @@ def scan(roots: list[str], progress: bool = False,
     # other's failures the way a module global did.
     failures = [] if failures is None else failures
     suppressed = [] if suppressed is None else suppressed
-    del failures[:], suppressed[:]
+    warnings = [] if warnings is None else warnings
+    del failures[:], suppressed[:], warnings[:]
+    warnings += root_ignore_warnings(paths)
     raw: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(scan_root, p): p for p in paths}
@@ -520,7 +677,7 @@ def scan(roots: list[str], progress: bool = False,
             start_line=h["StartLine"],
             end_line=h["EndLine"],
             entropy=h.get("Entropy", 0.0),
-            secret=h["Secret"],
+            secret=clean_secret(h["Secret"]),
             match=h.get("Match", ""),
         )
         found.setdefault(f.fingerprint, f)
@@ -710,7 +867,7 @@ def parse_kubeconfig(path: Path, text: str) -> list[Finding]:
     """token, password and client-key-data live under users[].user. Parsed rather
     than pattern-matched because removing one has to take its contexts with it."""
     out = []
-    user, name = None, ""
+    name = ""
     for i, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
         if stripped.startswith("- name:"):
@@ -719,7 +876,6 @@ def parse_kubeconfig(path: Path, text: str) -> list[Finding]:
         if m and len(m.group(2)) >= 8:
             out.append(_mk(str(path), i, "kubeconfig-credential",
                            f"{m.group(1)} for user {name or '?'}", m.group(2)))
-    del user
     return out
 
 
@@ -821,6 +977,10 @@ def parse_roots(roots: list[Path]) -> list[Finding]:
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
             dirnames[:] = [d for d in dirnames if not is_skipped(f"{dirpath}/{d}/")]
             for fn in filenames:
+                # Cheap first: only a file some parser claims by name is worth
+                # testing against the skip list. That was 82% of the walk's time.
+                if not any(rx.search(fn) for rx, _ in PARSERS):
+                    continue
                 full = Path(dirpath) / fn
                 if not is_skipped(str(full)):
                     out += parse_file(full)
@@ -845,6 +1005,18 @@ def _b64pad(chunk: str) -> bytes:
     return base64.urlsafe_b64decode(chunk + "=" * (-len(chunk) % 4))
 
 
+def jwt_claims(value: str) -> dict | None:
+    """The payload of a JWT, or None if the value is not one."""
+    v = value.strip()
+    if not JWT_RE.match(v):
+        return None
+    try:
+        claims = json.loads(_b64pad(v.split(".")[1]))
+    except Exception:  # noqa: BLE001
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
 def offline_check(value: str) -> tuple[str, str]:
     """(state, detail) with no network. States: live-shape, expired, malformed, unknown.
 
@@ -866,13 +1038,70 @@ def offline_check(value: str) -> tuple[str, str]:
     if AWS_ID_RE.match(v):
         return "live-shape", "well-formed AWS key id"
     if "BEGIN" in v and "PRIVATE KEY" in v:
-        body = "".join(ln for ln in v.splitlines() if "-----" not in ln)
-        try:
-            _b64pad(body.replace("/", "_").replace("+", "-"))
-        except Exception:  # noqa: BLE001
-            return "malformed", "PEM header present but the body does not decode"
-        return "live-shape", "private key, parses"
+        return private_key_state(v)
     return "unknown", ""
+
+
+def clean_secret(value: str) -> str:
+    """gitleaks reads JSON-escaped text as written, so a value at the end of an
+    escaped string keeps the escape's backslash. On one machine 54 of 55 JWTs
+    that read as unknown were expired tokens carrying exactly that."""
+    return value.rstrip("\\")
+
+
+OPENSSH_MAGIC = b"openssh-key-v1\0"
+
+
+def _der_complete(raw: bytes) -> bool:
+    """PKCS#1, PKCS#8 (plain or encrypted) and SEC1 keys are all one DER SEQUENCE
+    whose declared length is exactly the rest of the bytes."""
+    if len(raw) < 2 or raw[0] != 0x30:
+        return False
+    n = raw[1]
+    if n < 0x80:
+        return 2 + n == len(raw)
+    k = n & 0x7F
+    return 0 < k <= 4 and 2 + k + int.from_bytes(raw[2:2 + k], "big") == len(raw)
+
+
+def _openssh_complete(raw: bytes) -> bool:
+    """openssh-key-v1 (OpenSSH PROTOCOL.key): cipher, kdf, kdf options, a key
+    count, that many public keys and one private section, each length-prefixed,
+    and nothing after."""
+    at = len(OPENSSH_MAGIC)
+
+    def skip() -> bool:
+        nonlocal at
+        if at + 4 > len(raw):
+            return False
+        at += 4 + int.from_bytes(raw[at:at + 4], "big")
+        return at <= len(raw)
+
+    if not (skip() and skip() and skip()) or at + 4 > len(raw):
+        return False
+    count = int.from_bytes(raw[at:at + 4], "big")
+    at += 4
+    return 0 < count < 16 and all(skip() for _ in range(count + 1)) and at == len(raw)
+
+
+def private_key_state(pem: str) -> tuple[str, str]:
+    """A key that does not decode to a whole key cannot be used, so it is not
+    reported as one: test fixtures, truncated pastes and code that builds a PEM
+    string all land here."""
+    lines = [ln.strip().strip("\"',") for ln in pem.replace("\\n", "\n").splitlines()]
+    if any(ln.startswith("Proc-Type:") for ln in lines):
+        return "live-shape", "encrypted private key (legacy PEM), usable with its passphrase"
+    body = "".join(ln for ln in lines if ln and "-----" not in ln and ":" not in ln)
+    try:
+        raw = base64.b64decode(body + "=" * (-len(body) % 4), validate=True)
+    except ValueError:
+        return "malformed", "PEM markers present but the body is not base64"
+    if raw.startswith(OPENSSH_MAGIC):
+        return ("live-shape", "OpenSSH private key, complete") if _openssh_complete(raw) \
+            else ("malformed", "OpenSSH header but the key is incomplete")
+    if _der_complete(raw):
+        return "live-shape", "private key, complete"
+    return "malformed", "PEM body is not a complete key"
 
 
 # --------------------------------------------------------------------------- actions
@@ -933,6 +1162,18 @@ def _stash(batch: Path, src: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     return dest
+
+
+def _discard(backup: Path) -> None:
+    """Delete a backup we made. copy2 carries a read-only attribute over, and
+    Windows refuses to delete a read-only file, so clear it first. Never raises:
+    this runs inside error handling, and a backup that stays is still one undo
+    can use."""
+    try:
+        os.chmod(backup, stat.S_IWRITE | stat.S_IREAD)
+        backup.unlink()
+    except OSError:
+        pass
 
 
 def _parse_error(path: Path) -> str:
@@ -1021,8 +1262,7 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
     # Redact first: a file also queued for removal is skipped, not double-handled.
     by_file: dict[str, list[Finding]] = {}
     blocked = [(f, a) for f, a in chosen if a != "ignore" and not f.editable]
-    results += [{"fingerprint": f.fingerprint, "ok": False,
-                 "detail": "terraform state: rotate the credential, editing state corrupts it"}
+    results += [{"fingerprint": f.fingerprint, "ok": False, "detail": lock_reason(f.path)}
                 for f, _ in blocked]
     stop = {f.fingerprint for f, _ in blocked}
 
@@ -1030,77 +1270,42 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
         if a == "redact" and f.path not in remove and f.fingerprint not in stop:
             by_file.setdefault(f.path, []).append(f)
 
-    for path, group in by_file.items():
-        src = Path(path)
-        if not src.is_file():
-            results += [{"fingerprint": f.fingerprint, "ok": False, "detail": "file is gone"} for f in group]
-            continue
-        lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
-        changed = False
-        mark = len(entries)
-        for f in sorted(group, key=lambda f: -f.start_line):
-            lines, ok = redact_lines(lines, f)
-            results.append({
-                "fingerprint": f.fingerprint, "ok": ok,
-                "detail": "redacted" if ok else "value no longer on that line, left alone",
-            })
-            if ok:
-                changed = True
-                entries.append({"path": path, "action": "redact", "rule": f.rule,
-                                "sha8": f.sha8, "line": f.start_line})
-        # Only touch the file if something actually changed. Stashing regardless
-        # would leave an orphaned copy of the secret in the trash and bump the
-        # mtime of a file we did not edit. The original is still on disk here.
-        if changed:
-            stashed = _stash(batch, src)
-            src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
-            # A line-level replace inside a structured document can leave it
-            # unparseable. Check, and put the original back rather than hand the
-            # user a broken kubeconfig in exchange for a redacted line.
-            broke = _parse_error(src)
-            if broke:
-                shutil.copy2(stashed, src)
-                for r in results[-len(group):]:
-                    r["ok"], r["detail"] = False, f"left alone: editing it broke the file ({broke})"
-                # The rollback un-did every edit to this file, so the manifest must
-                # not keep claiming them: undo would otherwise "restore" a file
-                # that was never changed, over whatever is there by then.
-                del entries[mark:]
-                stashed.unlink(missing_ok=True)
+    try:
+        for path, group in by_file.items():
+            _redact_file(batch, Path(path), group, results, entries)
 
-    moved: set[str] = set()
-    for f, a in chosen:
-        if f.fingerprint in stop:
-            continue
-        if a == "remove":
-            if not f.removable:
-                results.append({"fingerprint": f.fingerprint, "ok": False,
-                                "detail": "history file: redact instead of removing"})
-            elif f.path in moved:
-                # Two secrets in one file: the first move took care of both.
-                results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
-            elif not Path(f.path).exists():
-                results.append({"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"})
-            else:
-                dest = batch / "files" / trash_rel(f.path)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(f.path, dest)  # move, never unlink
-                moved.add(f.path)
-                entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
-                results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"})
-        elif a == "ignore":
-            add_ignore(f)
-            results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
+        moved: set[str] = set()
+        for f, a in chosen:
+            if f.fingerprint in stop:
+                continue
+            if a == "remove":
+                results.append(_remove_one(batch, f, moved, entries))
+            elif a == "ignore":
+                try:
+                    add_ignore(f)
+                    results.append({"fingerprint": f.fingerprint, "ok": True, "detail": "ignored from now on"})
+                except OSError as e:
+                    results.append({"fingerprint": f.fingerprint, "ok": False,
+                                    "detail": f"could not record the ignore: {e.strerror or e}"})
 
-    # A redaction on a file that was also removed never ran, but the value went with
-    # the file. Say so, rather than leaving that row with no outcome at all.
-    for f, a in chosen:
-        if a == "redact" and f.path in remove and f.fingerprint not in stop:
-            gone = f.path in moved
-            results.append({
-                "fingerprint": f.fingerprint, "ok": gone,
-                "detail": "removed with the file" if gone else "the file could not be removed",
-            })
+        # A redaction on a file that was also removed never ran, but the value went
+        # with the file. Say so, rather than leaving that row with no outcome at all.
+        for f, a in chosen:
+            if a == "redact" and f.path in remove and f.fingerprint not in stop:
+                gone = f.path in moved
+                results.append({
+                    "fingerprint": f.fingerprint, "ok": gone,
+                    "detail": "removed with the file" if gone else "the file could not be removed",
+                })
+    finally:
+        # Written whatever happened above, so a batch on disk always says what it
+        # holds. Paths, rule ids and hashes only: no secret value reaches this file.
+        if batch:
+            (batch / "manifest.json").write_text(json.dumps(
+                {"created": datetime.now(timezone.utc).isoformat(), "entries": entries}, indent=1))
+            if not entries and not any(p.is_file() for p in (batch / "files").rglob("*")):
+                shutil.rmtree(batch, ignore_errors=True)
+                batch = None
 
     rolled: dict[str, dict] = {}
     for r in results:
@@ -1118,16 +1323,87 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
         elif agg["done"]:
             agg["detail"] = f"{agg['done']} done, {agg['failed']} skipped: {agg['detail']}"
     results = list(rolled.values())
-
-    if batch:
-        # Paths, rule ids and hashes only. No secret value reaches this file.
-        (batch / "manifest.json").write_text(
-            json.dumps({"created": datetime.now(timezone.utc).isoformat(), "entries": entries}, indent=1)
-        )
-        if not entries:
-            shutil.rmtree(batch, ignore_errors=True)
-            batch = None
     return {"batch": batch.name if batch else None, "results": results}
+
+
+def _redact_file(batch: Path, src: Path, group: list[Finding], results: list[dict],
+                 entries: list[dict]) -> None:
+    """Every secret in one file, as one edit. A file that cannot be read or
+    written fails on its own: the rest of the batch still runs and reports."""
+    mark, first = len(entries), len(results)
+    stashed, writing = None, False
+    try:
+        if not src.is_file():
+            results += [{"fingerprint": f.fingerprint, "ok": False, "detail": "file is gone"} for f in group]
+            return
+        lines = src.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+        changed = False
+        for f in sorted(group, key=lambda f: -f.start_line):
+            lines, ok = redact_lines(lines, f)
+            results.append({
+                "fingerprint": f.fingerprint, "ok": ok,
+                "detail": "redacted" if ok else "value no longer on that line, left alone",
+            })
+            if ok:
+                changed = True
+                entries.append({"path": str(src), "action": "redact", "rule": f.rule,
+                                "sha8": f.sha8, "line": f.start_line})
+        # Only touch the file if something actually changed. Stashing regardless
+        # would leave an orphaned copy of the secret in the trash and bump the
+        # mtime of a file we did not edit. The original is still on disk here.
+        if not changed:
+            return
+        stashed = _stash(batch, src)
+        writing = True
+        src.write_text("".join(lines), encoding="utf-8", errors="surrogateescape")
+        # A line-level replace inside a structured document can leave it
+        # unparseable. Check, and put the original back rather than hand the
+        # user a broken kubeconfig in exchange for a redacted line.
+        broke = _parse_error(src)
+        if broke:
+            shutil.copy2(stashed, src)
+            for r in results[first:]:
+                r["ok"], r["detail"] = False, f"left alone: editing it broke the file ({broke})"
+            # The rollback un-did every edit to this file, so the manifest must
+            # not keep claiming them: undo would otherwise "restore" a file
+            # that was never changed, over whatever is there by then.
+            del entries[mark:]
+            _discard(stashed)
+    except OSError as e:
+        detail = f"could not edit: {e.strerror or e}"
+        restored = not writing
+        if writing and stashed:
+            try:
+                # A write refused at open left the file as it was; one that failed
+                # part way may have truncated it, so put the original back.
+                if src.read_bytes() != stashed.read_bytes():
+                    shutil.copy2(stashed, src)
+                restored = True
+            except OSError:
+                detail += "; undo puts the original back"
+        if stashed and restored:
+            _discard(stashed)  # no orphan copy of the secret
+            del entries[mark:]
+        results[first:] = [{"fingerprint": f.fingerprint, "ok": False, "detail": detail} for f in group]
+
+
+def _remove_one(batch: Path, f: Finding, moved: set[str], entries: list[dict]) -> dict:
+    if not f.removable:
+        return {"fingerprint": f.fingerprint, "ok": False, "detail": "history file: redact instead of removing"}
+    if f.path in moved:
+        # Two secrets in one file: the first move took care of both.
+        return {"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"}
+    if not Path(f.path).exists():
+        return {"fingerprint": f.fingerprint, "ok": False, "detail": "already gone"}
+    try:
+        dest = batch / "files" / trash_rel(f.path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(f.path, dest)  # move, never unlink
+    except OSError as e:
+        return {"fingerprint": f.fingerprint, "ok": False, "detail": f"could not move: {e.strerror or e}"}
+    moved.add(f.path)
+    entries.append({"path": f.path, "action": "remove", "rule": f.rule, "sha8": f.sha8})
+    return {"fingerprint": f.fingerprint, "ok": True, "detail": "moved to trash"}
 
 
 def add_ignore(f: Finding) -> None:
@@ -1350,11 +1626,11 @@ class Handler(BaseHTTPRequestHandler):
         self._guard(self._post)
 
     def _guard(self, handler) -> None:
-        """Answer every request, even a failing one. Anything reaching here is a
-        filesystem error the route did not expect."""
+        """Answer every request, even a failing one. Anything reaching here is an
+        error the route did not expect."""
         try:
             handler()
-        except OSError as e:
+        except Exception as e:  # noqa: BLE001 - a request must always get an answer
             self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
     def _get(self) -> None:
@@ -1372,18 +1648,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, b"forbidden", "text/plain")
         route = urlparse(self.path).path
         if route == "/api/rescan":
-            git_tracked.cache_clear()  # a file may have been committed since the last scan
+            clear_git_cache()
             failures: list[str] = []
             dropped: list[Finding] = []
+            warnings: list[str] = []
             try:
-                found = scan(self.state["roots"], failures=failures, suppressed=dropped)
-                published = _scan_state(found, failures, dropped)
+                found = scan(self.state["roots"], failures=failures, suppressed=dropped,
+                             warnings=warnings)
+                # Live results are kept by value, so a rescan does not forget them.
+                found = apply_live(found, dropped, self.state.get("live", {}))
+                published = _scan_state(found, failures, dropped, warnings)
             except (RuntimeError, OSError) as e:
                 # scan raises when no root could be read at all, and grouping
                 # shells out to git. Answer with the reason rather than dropping
                 # the connection.
                 return self._json({"error": f"scan failed: {e}", **self.snapshot()}, 503)
             self.state["scan"] = published
+            self.state["results"] = {}
             return self._json(self.snapshot())
         if not self.state["apply"]:
             return self._json({"error": "preview mode: restart with --apply to make changes"}, 403)
@@ -1401,12 +1682,16 @@ class Handler(BaseHTTPRequestHandler):
                 out = apply_actions(self.state["scan"]["groups"], body.get("actions"))
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
+            self.state.setdefault("results", {}).update({r["key"]: r for r in out["results"]})
         elif route == "/api/undo":
             out = undo()
+            if out["ok"]:
+                self.state["results"] = {}
         else:
             return self._send(404, b"not found", "text/plain")
         # Handled findings stay in the list so the UI can show what happened to
-        # each one. Rescan is what clears them.
+        # each one. Rescan is what clears them. The snapshot's results win: they
+        # hold every outcome this session, not only this request's.
         self._json({**out, **self.snapshot()})
 
     def snapshot(self) -> dict:
@@ -1423,12 +1708,15 @@ class Handler(BaseHTTPRequestHandler):
             "gitleaks": self.state["gitleaks"],
             "batches": [b.name for b in batches()],
             "failures": list(scanned["failures"]),
+            "warnings": list(scanned["warnings"]),
             "suppressed": scanned["suppressed"],
+            "results": list(self.state.get("results", {}).values()),
         }
 
 
 def _scan_state(findings: list[Finding], failures: list[str] | None,
-                suppressed: list[Finding] | None = None) -> dict:
+                suppressed: list[Finding] | None = None,
+                warnings: list[str] | None = None) -> dict:
     """Everything a rescan replaces, in one object. Assigning groups, failures and
     the timestamp separately lets a reader pair one scan's findings with another
     scan's failure list, and a run whose roots could not be read would then show
@@ -1437,6 +1725,7 @@ def _scan_state(findings: list[Finding], failures: list[str] | None,
     return {
         "groups": {g.key: g for g in group_findings(findings)},
         "failures": list(failures or []),
+        "warnings": list(warnings or []),
         "suppressed": suppression_summary(suppressed or []),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -1444,9 +1733,15 @@ def _scan_state(findings: list[Finding], failures: list[str] | None,
 
 def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
           open_browser: bool = True, failures: list[str] | None = None,
-          suppressed: list[Finding] | None = None) -> str:
+          suppressed: list[Finding] | None = None,
+          warnings: list[str] | None = None,
+          live: dict[str, tuple[str, str]] | None = None) -> str:
     Handler.state = {
-        "scan": _scan_state(findings, failures, suppressed),
+        "scan": _scan_state(findings, failures, suppressed, warnings),
+        "live": live or {},
+        # What happened to each row this session, kept here so a reload or an undo
+        # shows the truth rather than whatever the page last remembered.
+        "results": {},
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
@@ -1480,6 +1775,21 @@ def suppression_summary(suppressed: list[Finding]) -> list[dict]:
         key=lambda r: -r["count"])
 
 
+def apply_live(found: list[Finding], dropped: list[Finding],
+               live: dict[str, tuple[str, str]]) -> list[Finding]:
+    """Carry live-check results by value, and move what the issuer rejected into
+    the suppressed list: a revoked credential needs no action."""
+    kept = []
+    for f in found:
+        f.live = live.get(f.digest, f.live)
+        if f.live[0] == "revoked":
+            f.suppressed_by, f.suppressed_why = "revoked", "the issuer rejected it in a live check"
+            dropped.append(f)
+        else:
+            kept.append(f)
+    return kept
+
+
 def run_live_verification(findings: list[Finding]) -> list[Finding]:
     """Opt-in, and loud about it. verify.py is imported here and nowhere else, so
     the scanner and server have no network capability to misuse."""
@@ -1487,10 +1797,11 @@ def run_live_verification(findings: list[Finding]) -> list[Finding]:
 
     rules = sorted({f.rule for f in findings if verify.verifiable(f.rule)})
     if not rules:
-        print("  nothing here has a verifier; leaving them as offline checks only")
+        print("  nothing here has a verifier; leaving them as offline checks only", file=sys.stderr)
         return findings
-    print(f"  asking {', '.join(verify.destinations(rules))} whether these still work.")
-    print("  this is a real request with your credential and lands in their audit log.")
+    # stderr, so `scan --json --verify live` still emits clean JSON on stdout.
+    print(f"  asking {', '.join(verify.destinations(rules))} whether these still work.", file=sys.stderr)
+    print("  this is a real request with your credential and lands in their audit log.", file=sys.stderr)
     canaries = verify.load_registry(STATE / "canaries.txt")
     done: dict[str, tuple[str, str]] = {}
     for f in findings:
@@ -1506,22 +1817,26 @@ def run_live_verification(findings: list[Finding]) -> list[Finding]:
 
 
 def print_table(findings: list[Finding], failures: list[str] | None = None,
-                suppressed: list[Finding] | None = None) -> None:
+                suppressed: list[Finding] | None = None,
+                warnings: list[str] | None = None) -> None:
     groups = group_findings(findings)
-    if not groups:
-        print("No secrets found.")
-        _print_suppressed(suppressed)
-        return
-    print(f"{'VALUE':<18}  {'RULE':<24}  {'COPIES':>6}  {'FLAGS':<10}  FIRST SEEN")
+    if groups:
+        print(f"{'VALUE':<18}  {'RULE':<24}  {'COPIES':>6}  {'FLAGS':<10}  FIRST SEEN")
     for g in groups:
         print(f"{mask(g.lead.secret):<18}  {g.lead.rule[:24]:<24}  {len(g.members):>6}  "
               f"{'committed' if g.tracked else '':<10}  {display_path(g.lead.path)[-60:]}:{g.lead.start_line}")
-
+    # A failed root or an uncountable ignore file is reported even when nothing was
+    # found: "No secrets found" next to an unscanned root is not a clean bill.
     for f in failures or []:
         print(f"  WARNING unscanned: {f[:200]}")
-    tracked = sum(g.tracked for g in groups)
-    print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
-          f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
+    for w in warnings or []:
+        print(f"  NOTE {w}")
+    if groups:
+        tracked = sum(g.tracked for g in groups)
+        print(f"\n{len(groups)} distinct secret(s) across {len(findings)} location(s). "
+              f"{tracked} appear in a committed file: rotate those, removing the file does not unleak them.")
+    else:
+        print("No secrets found.")
     _print_suppressed(suppressed)
 
 
@@ -1543,7 +1858,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
     ap.add_argument("--quick", action="store_true",
                     help="scan the known credential stores only, not the whole home directory")
-    ap.add_argument("--verify", choices=("never", "offline", "live"), default="offline",
+    ap.add_argument("--verify", choices=("offline", "live"), default="offline",
                     help="offline (default) checks shape and expiry with no network; "
                          "live also asks each provider, which writes to their audit log")
     ap.add_argument("--docker", action="store_true",
@@ -1570,31 +1885,37 @@ def main(argv: list[str] | None = None) -> int:
     roots = a.root or (quick_roots() if a.quick else default_roots())
     failures: list[str] = []
     dropped: list[Finding] = []
+    warnings: list[str] = []
     try:
         if not (a.command == "scan" and a.json):
             scope = "quick" if a.quick else ("custom" if a.root else "home")
             print(f"secret-vacuum  |  gitleaks {gitleaks_version()}  |  "
                   f"{scope} scope, {len(roots)} root(s)...")
         findings = scan(roots, progress=not (a.command == "scan" and a.json),
-                        failures=failures, suppressed=dropped)
+                        failures=failures, suppressed=dropped, warnings=warnings)
     except (RuntimeError, OSError) as e:
         # Every root failed, or the scanner is not installed at all. Say why,
         # rather than printing a traceback.
         return print(f"scan failed: {e}", file=sys.stderr) or 2
 
+    live: dict[str, tuple[str, str]] = {}
     if a.verify == "live":
         findings = run_live_verification(findings)
+        live = {f.digest: f.live for f in findings if f.live[0]}
+        findings = apply_live(findings, dropped, live)
 
     if a.command == "scan":
         if a.json:
             print(json.dumps({"findings": [g.public() for g in group_findings(findings)],
-                              "suppressed": suppression_summary(dropped)}, indent=1))
+                              "suppressed": suppression_summary(dropped),
+                              "failures": failures, "warnings": warnings}, indent=1))
         else:
-            print_table(findings, failures, dropped)
-        return 0
+            print_table(findings, failures, dropped, warnings)
+        # 0 full scan, 1 some roots could not be read, 2 nothing could be (above).
+        return 1 if failures else 0
 
     serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures,
-          suppressed=dropped)
+          suppressed=dropped, warnings=warnings, live=live)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

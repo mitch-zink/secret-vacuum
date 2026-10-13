@@ -9,9 +9,9 @@ whose fields are credentials by definition -- Terraform state, `.env`, Docker `c
 kubeconfig, Dockerfiles. Patterns alone miss those: a value whose variable name is not in the
 keyword list, or one that is base64 inside a state file, looks like nothing to a regex.
 
-**Nothing is filtered silently.** Every finding this tool drops is counted, attributed to a named
-rule with a reason, and one click from being shown. A scan that filtered everything must never look
-like a scan that found nothing.
+**Nothing is filtered without a count.** Every finding this tool drops is counted, attributed to a
+named rule with a reason, and one click from being shown. A scan that filtered everything must never
+look like a scan that found nothing.
 
 ![secret-vacuum UI](docs/ui.png)
 
@@ -38,6 +38,9 @@ python3 secret_vacuum.py env        # what cannot be deleted: env vars, containe
 | `--root PATH` | scan this instead of the defaults, repeatable |
 | `--no-filter` | report everything, including what the suppressors would drop |
 | `--verify live` | also ask each provider whether the credential still works. Off by default. |
+
+Exit codes: `0` a full scan, `1` some roots could not be read (named in the output), `2` nothing
+could be scanned. `scan --json` carries the same `failures`, plus `warnings` and `suppressed`.
 
 The default scope is your home directory minus a deny-list of caches, VM images and OS containers.
 An allow-list of known dotfiles was the earlier default and it was wrong the moment a vendor invented
@@ -97,6 +100,42 @@ allowlist away its leaks behind your back. Anything the shipped list gets wrong 
 A root that cannot be scanned is reported as a failure in the UI and on the command line, never
 counted as clean. If no root can be scanned at all, the tool errors out.
 
+### Findings nobody could use
+
+The rules below drop a real match because nobody holding it could do anything with it. Each one is
+named in the UI's suppressed banner with its count and paths, and `--no-filter` turns them all off.
+Context rules only ever overrule gitleaks' generic keyword-and-entropy rule, never a typed one.
+
+| rule | drops | hits on the reference machine |
+|---|---|---:|
+| `placeholder` | documentation placeholder, not a value | 9 |
+| `env-reference` | a pointer to a secret, not one | 0 |
+| `filler` | keyboard-mash or one character repeated | 0 |
+| `aws-example-key` | the key id from AWS' own documentation | 0 |
+| `presigned-url` | an expiring S3 signature, not a stored credential | 0 |
+| `expired-jwt` | an expired token grants nothing | 191 |
+| `public-jwt` | a client-side key (role anon), public by design | 8 |
+| `publishable-key` | a publishable key, meant to ship in client code | 24 |
+| `public-env` | a build-time public variable, shipped to every browser | 3 |
+| `git-sha` | a commit hash, not a credential | 2 |
+| `not-a-credential` | a request id, session slug, identifier or hash under a key-like name | 2,716 |
+| `embedded-blob` | a slice of a long base64 blob, such as an embedded image | 0 |
+| `session-log` | generic match in an AI session log or skill doc, mostly prose and tool output; typed rules still report | 103 |
+| `app-data` | inside an app's own database; sign out of the app to clear it | 410 |
+| `expired-aws-session` | a temporary AWS key in a file older than its 36-hour maximum life | 0 |
+| `generic-in-text` | generic match in a log, document or data export; typed rules still report | 8,319 |
+| `unusable-key` | a private-key block that does not decode to a whole key | 58 |
+| `example-file` | a template file, its values are samples | 141 |
+| `revoked` | the issuer rejected it in a live check (`--verify live` only) | n/a |
+
+Counts are hits (one value can be many hits) from a full home-directory scan of the machine this
+was built on. The same scan went from 538 rows to 221, and every credential checked by hand survived.
+
+**App data.** Browser and desktop-app databases (IndexedDB, Local Storage, extension storage,
+`Preferences`, macOS `Library/Preferences/*.plist`) hold the apps' own sessions. Editing one in place
+corrupts the app's database, so these are never edited: `--no-filter` shows them locked, tagged
+*app data*. The fix is to sign out of the app or clear its data.
+
 ## Secrets already committed to a repo
 
 A secret in a past commit is in every clone and in the history. Deleting the working-tree file
@@ -128,9 +167,14 @@ Two answers, and only the first is on by default.
 
 **Offline**, with no network at all: a JWT carries its own expiry, a private key parses or it does
 not, an AWS key id has a fixed shape. Every finding reports `live-shape`, `expired`, `malformed` or
-`unknown`, and the table sorts by exploitability rather than by presence.
+`unknown`, and the table sorts by exploitability rather than by presence. A private key counts as
+`live-shape` only when its body decodes to a whole key (DER, or OpenSSH's `openssh-key-v1`
+container); a truncated paste or a test fixture is `malformed` and suppressed.
 
-**`--verify live`** asks each provider whether the credential actually works. That is the difference
+**`--verify live`** asks each provider whether the credential actually works: GitHub, Stripe, Slack
+bot tokens, OpenAI, Anthropic, and Slack incoming webhooks. A webhook is checked by posting a body
+that is deliberately not JSON, so a live hook refuses it and nothing reaches a channel. Anything the
+issuer rejects moves to the suppressed banner as *revoked*, and the result is kept across rescans. That is the difference
 between a guess and an answer, and it is also a real request with your credential: it lands in the
 provider's audit log, it can trip impossible-travel alerts, it consumes rate limit, and against a
 honeytoken it *is* the alarm. So it is off by default, it prints every host it will contact before
@@ -138,7 +182,7 @@ the first call, a rate-limited or unreachable check reports `unknown` rather tha
 credential in a canary-shaped path or in `~/.secret-vacuum/canaries.txt` is never verified.
 
 It lives in `verify.py`, which `secret_vacuum.py` imports only inside the one function `--verify
-live` reaches. The scanner, the local server and the UI have no network capability at all — that
+live` reaches. The scanner, the local server and the UI have no network capability at all; that
 stays a property of the code rather than of a flag.
 
 ## What cannot be deleted
@@ -159,21 +203,24 @@ it, once you have dealt with the file.
 
 Each of these is a test in `test_secret_vacuum.py`.
 
-1. **No secret value is ever written to disk by this tool.** The gitleaks report streams to stdout
-   and stays in memory. Anything recorded on disk holds a path, a line number, a rule id and a
-   SHA-256 prefix — never the value.
+1. **No secret value is written to disk by this tool, except the trash.** The gitleaks report
+   streams to stdout and stays in memory. Manifests and ignore entries hold a path, a line number, a
+   rule id and a SHA-256 prefix, never the value. Redact and remove keep a full copy of the original
+   file under `~/.secret-vacuum/trash/` so `undo` can put it back; delete a batch once you are sure.
 2. **Remove means move, not unlink.** Every removal lands in the trash and `undo` reverses it.
 3. **The server is loopback-only.** It binds `127.0.0.1` on a random port, requires a 32-byte
    per-run token, rejects any request whose `Host` is not the literal loopback address (DNS
    rebinding), rejects a foreign `Origin`, and never emits a CORS header. Request logging is off
    because the URL carries the token.
 4. **Nothing leaves the machine.** No telemetry, no update check, no network call from the scanner,
-   the server or the UI — a test asserts `secret_vacuum.py` cannot reach the network at all.
+   the server or the UI; a test asserts `secret_vacuum.py` cannot reach the network at all.
    `--verify live` is the single exception, opt-in per run, confined to `verify.py`, and pinned so a
    verifier can only ever contact the service that issued the credential it is checking.
-5. **Nothing is dropped silently.** Every suppressed finding is counted and attributable. Skipping a
-   generated tree is the only quiet filtering, because listing several million skipped files tells
-   you nothing.
+5. **Nothing is dropped without a count.** Every suppressed finding is counted and attributable.
+   Three filters are quiet. Skipping generated trees, because listing several million skipped files
+   tells you nothing. gitleaks' inline `gitleaks:allow` markers, an author's statement about one
+   line. And a `.gitleaksignore` at the top of a scanned folder, which gitleaks always applies and
+   cannot be counted, so the file is named in a NOTE instead.
 
 Writes are off unless you pass `--apply`.
 
@@ -191,7 +238,7 @@ secret scanners, including its own pre-commit hook.
 ## Requirements
 
 Python 3.10+ and the `gitleaks` binary. Nothing else: no pip install, no npm, no build step.
-Tested on macOS, Linux and Windows in CI.
+Tested on macOS, Linux and Windows in CI, on GitHub-hosted runners.
 
 ## License
 
