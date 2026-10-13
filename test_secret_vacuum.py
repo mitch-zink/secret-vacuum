@@ -1681,6 +1681,38 @@ def test_one_unwritable_file_does_not_abort_the_batch(tmp_path: Path):
                    for p in (batch / "files").rglob("*") if p.is_file()), "no orphan backup"
 
 
+def test_a_slack_webhook_is_checked_without_posting_anything():
+    """The check sends a body that is not JSON, so a live hook refuses it and posts
+    nothing. Slack's answer separates a live hook from a dead one."""
+    import verify
+    hook = "https://hooks.slack.com/services/" + "T0000/B0000/" + "x" * 24
+    sent = []
+
+    def answering(code, body):
+        def opener(req, timeout=0):
+            sent.append(req)
+            raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(body))
+        return opener
+
+    assert verify.verify("slack-webhook-url", hook, opener=answering(400, b"invalid_payload"))[0] == "live"
+    assert verify.verify("slack-webhook-url", hook, opener=answering(404, b"no_team"))[0] == "revoked"
+    assert verify.verify("slack-webhook-url", hook, opener=answering(400, b"invalid_token"))[0] == "revoked"
+    assert verify.verify("slack-webhook-url", hook, opener=answering(429, b""))[0] == "unknown"
+    assert all(r.data and not r.data.startswith(b"{") for r in sent), "never a postable payload"
+    n = len(sent)
+    assert verify.verify("slack-webhook-url", "https://evil.example/services/x",
+                         opener=answering(400, b"invalid_payload"))[0] == "unknown"
+    assert len(sent) == n, "a URL outside the pinned prefix is never contacted"
+
+
+def test_a_revoked_value_moves_to_the_suppressed_list():
+    f = finding("/x/.env", FAKE_STRIPE)
+    g = finding("/x/.env", FAKE_AWS_SECRET, line=2)
+    dropped: list[sv.Finding] = []
+    kept = sv.apply_live([f, g], dropped, {f.digest: ("revoked", "rejected (401)")})
+    assert kept == [g] and dropped == [f] and f.suppressed_by == "revoked"
+
+
 def test_the_plain_runner_sees_every_test():
     """CI runs this file directly. A test defined below the __main__ block is
     invisible to that runner while pytest still finds it."""

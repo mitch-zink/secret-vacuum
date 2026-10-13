@@ -1636,6 +1636,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 found = scan(self.state["roots"], failures=failures, suppressed=dropped,
                              warnings=warnings)
+                # Live results are kept by value, so a rescan does not forget them.
+                found = apply_live(found, dropped, self.state.get("live", {}))
                 published = _scan_state(found, failures, dropped, warnings)
             except (RuntimeError, OSError) as e:
                 # scan raises when no root could be read at all, and grouping
@@ -1707,9 +1709,11 @@ def _scan_state(findings: list[Finding], failures: list[str] | None,
 def serve(findings: list[Finding], roots: list[str], apply_mode: bool,
           open_browser: bool = True, failures: list[str] | None = None,
           suppressed: list[Finding] | None = None,
-          warnings: list[str] | None = None) -> str:
+          warnings: list[str] | None = None,
+          live: dict[str, tuple[str, str]] | None = None) -> str:
     Handler.state = {
         "scan": _scan_state(findings, failures, suppressed, warnings),
+        "live": live or {},
         "roots": roots,
         "apply": apply_mode,
         "token": secrets.token_urlsafe(32),
@@ -1741,6 +1745,21 @@ def suppression_summary(suppressed: list[Finding]) -> list[dict]:
         ({"rule": k, "reason": v[0].suppressed_why, "count": len(v),
           "paths": sorted({display_path(m.path) for m in v})[:50]} for k, v in by_rule.items()),
         key=lambda r: -r["count"])
+
+
+def apply_live(found: list[Finding], dropped: list[Finding],
+               live: dict[str, tuple[str, str]]) -> list[Finding]:
+    """Carry live-check results by value, and move what the issuer rejected into
+    the suppressed list: a revoked credential needs no action."""
+    kept = []
+    for f in found:
+        f.live = live.get(f.digest, f.live)
+        if f.live[0] == "revoked":
+            f.suppressed_by, f.suppressed_why = "revoked", "the issuer rejected it in a live check"
+            dropped.append(f)
+        else:
+            kept.append(f)
+    return kept
 
 
 def run_live_verification(findings: list[Finding]) -> list[Finding]:
@@ -1850,8 +1869,11 @@ def main(argv: list[str] | None = None) -> int:
         # rather than printing a traceback.
         return print(f"scan failed: {e}", file=sys.stderr) or 2
 
+    live: dict[str, tuple[str, str]] = {}
     if a.verify == "live":
         findings = run_live_verification(findings)
+        live = {f.digest: f.live for f in findings if f.live[0]}
+        findings = apply_live(findings, dropped, live)
 
     if a.command == "scan":
         if a.json:
@@ -1864,7 +1886,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if failures else 0
 
     serve(findings, roots, a.apply, open_browser=not a.no_browser, failures=failures,
-          suppressed=dropped, warnings=warnings)
+          suppressed=dropped, warnings=warnings, live=live)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
