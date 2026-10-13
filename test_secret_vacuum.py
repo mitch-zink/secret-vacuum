@@ -1694,7 +1694,17 @@ def test_findings_nobody_could_use_are_suppressed_and_named(tmp_path: Path):
     meta.write_text('{"gitBranch":"HEAD","slug":"Zm9vYmFyYmF6cXV4"}\n')
     blob = tmp_path / "b.jsonl"
     blob.write_text("A1b2" * 40 + "Zm9vYmFyYmF6cXV4\n")
+    mutex = tmp_path / "resources.json"
+    mutex.write_text('{"mutex_key":"Zm9vYmFyYmF6cXV4"}\n')
+    sts = tmp_path / "sts.txt"
+    sts.write_text("ASIA" + "Q" * 16 + "\n")
+    old = time.time() - 40 * 3600
+    os.utime(sts, (old, old))
     cases = {
+        "app-data": finding("/u/Library/Application Support/Comet/Default/Local Storage/leveldb/000003.log",
+                            FAKE_STRIPE, rule="stripe-access-token"),
+        "expired-aws-session": finding(str(sts), "ASIA" + "Q" * 16, rule="aws-access-token"),
+        "generic-in-text": finding("/u/proj/logs/run.log", "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
         "session-log": finding("/u/.claude/projects/x/s.jsonl", "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
         "embedded-blob": finding(str(blob), "Zm9vYmFyYmF6cXV4", rule="generic-api-key"),
         "expired-jwt": finding("/x/auth.json", _jwt(exp=past)),
@@ -1709,6 +1719,9 @@ def test_findings_nobody_could_use_are_suppressed_and_named(tmp_path: Path):
     kept, dropped = sv.partition(list(cases.values()))
     assert not kept, [f.path for f in kept]
     assert {f.suppressed_by for f in dropped} == set(cases)
+    # an identifier or hash under a key-like name is not a credential either
+    hashed = finding(str(mutex), "Zm9vYmFyYmF6cXV4", rule="generic-api-key")
+    assert sv.partition([hashed])[1][0].suppressed_by == "not-a-credential"
 
 
 def test_a_jwt_that_still_grants_access_is_kept(tmp_path: Path):
@@ -1719,8 +1732,33 @@ def test_a_jwt_that_still_grants_access_is_kept(tmp_path: Path):
     notes = tmp_path / "notes"
     notes.write_text("token: " + "0123abcd" * 5 + "\n")
     sha_in_prose = finding(str(notes), "0123abcd" * 5, rule="sourcegraph-access-token")
-    kept, _ = sv.partition([svc, noexp, sha_in_prose])
-    assert kept == [svc, noexp, sha_in_prose]
+    fresh = tmp_path / "fresh.txt"
+    fresh.write_text("ASIA" + "Q" * 16 + "\n")  # touched now: may still be live
+    sts_new = finding(str(fresh), "ASIA" + "Q" * 16, rule="aws-access-token")
+    stale = tmp_path / "stale.txt"
+    stale.write_text(FAKE_AWS_ID + "\n")
+    os.utime(stale, (time.time() - 90 * 86400,) * 2)
+    akia_old = finding(str(stale), FAKE_AWS_ID, rule="aws-access-token")  # long-lived key
+    typed_in_log = finding("/u/proj/logs/run.log", "ghp_" + "a1B2" * 9, rule="github-pat")
+    project_db = finding("/u/Documents/proj/databases/.env", "Zm9vYmFyYmF6cXV4", rule="generic-api-key")
+    keep = [svc, noexp, sha_in_prose, sts_new, akia_old, typed_in_log, project_db]
+    kept, _ = sv.partition(keep)
+    assert kept == keep
+
+
+def test_app_data_is_never_edited(tmp_path: Path):
+    """An app's own database is reported, never edited: a line replace inside
+    LevelDB corrupts the profile, and signing out is the real fix."""
+    sandbox(tmp_path)
+    store = tmp_path / "Library/Application Support/Chrome/Default/Local Storage/leveldb/000003.log"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"\x00\x01key=" + FAKE_STRIPE.encode() + b"\x02\n")
+    before = store.read_bytes()
+    f = finding(str(store), FAKE_STRIPE, rule="stripe-access-token")
+    assert f.editable is False and f.suggested == "ignore"
+    out = act("redact", f)
+    assert out["results"][0]["ok"] is False and "sign out" in out["results"][0]["detail"]
+    assert store.read_bytes() == before
 
 
 if __name__ == "__main__":

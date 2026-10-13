@@ -74,6 +74,14 @@ paths = [
   '''(?i)(^|/)\$RECYCLE\.BIN/''',
   '''(^|/)(OrbStack|\.orbstack|\.vagrant\.d|VirtualBox VMs)/''',
   '''(?i)\.(iso|dmg|vmdk|vdi|vhdx?|qcow2|img|sparsebundle|sparseimage)$''',
+  # browser network caches, crash dumps and diagnostics: page bytes and minidumps
+  '''(^|/)(NetworkCache|Crashpad|DiagnosticReports|adblock|CachedProfilesData)/''',
+  '''(?i)\.(ips|zenc)$''',
+  # agent CLIs and bundled runtimes that ship their own copy of node and JS
+  '''(^|/)\.local/share/cursor-agent/versions/''',
+  '''(^|/)runtimes/node/''',
+  # sqlite files named without an extension, and their side files
+  '''(?i)(^|/)[^/]*_db(-wal|-shm|-journal)?$''',
   # macOS app bundles and their vendored frameworks: somebody else's compiled
   # code, in the same category as node_modules.
   '''(?i)\.(app|framework|kext|xpc|bundle)/''',

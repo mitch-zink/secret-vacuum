@@ -126,6 +126,37 @@ ACTIONS = ("remove", "redact", "ignore")
 # reported, and the only honest action is to rotate the credential upstream.
 ROTATE_ONLY = re.compile(r"\.tfstate(\.backup)?$", re.IGNORECASE)
 
+# Inside an app's own profile store. Editing these files in place corrupts the
+# app's database, and the values are the app's sessions: signing out or clearing
+# the app's data is the fix, not this tool. Scoped to app-data roots so a project
+# folder that happens to be called "databases" is not caught.
+APP_DATA = re.compile(
+    r"(?i)(Library/Application Support|AppData/(Local|Roaming)|\.config)/.+/"
+    r"(IndexedDB|Local Storage|Session Storage|Local Extension Settings|Sync Extension Settings"
+    r"|Extension State|File System|shared_proto_db|databases|blob_storage|GCM Store|Sessions"
+    r"|Service Worker|Sync Data|leveldb)/"
+    r"|(Library/Application Support|AppData/(Local|Roaming)|\.config)/.+/"
+    r"(Preferences|Secure Preferences|Local State|Cookies|Login Data|Web Data"
+    r"|BrowsingTopicsState|TransportSecurity)$"
+    r"|/Library/Preferences/[^/]+\.plist$")
+
+
+def lock_reason(path: str) -> str:
+    """Why no edit is safe here, or "" when one is."""
+    if ROTATE_ONLY.search(base_name(path)):
+        return "terraform state: rotate the credential, editing state corrupts it"
+    if APP_DATA.search(str(path).replace("\\", "/")):
+        return "an app's own database: sign out of the app or clear its data instead"
+    return ""
+
+
+def _older_than(path: str, seconds: float) -> bool:
+    try:
+        return datetime.now(timezone.utc).timestamp() - os.path.getmtime(path) > seconds
+    except OSError:
+        return False
+
+
 # Formats where a successful write still has to produce a parseable document.
 STRUCTURED = {
     ".json": json.loads,
@@ -164,7 +195,11 @@ class Suppressor:
 
 NOT_A_CREDENTIAL = re.compile(
     r"(?i)(request[-_]?id|page[-_]?token|next[-_]?token|cursor|etag|correlation[-_]?id|trace[-_]?id"
-    r"|idempotency[-_]?key|token[ _]prefix|gitBranch|slug)[\"']?\s*[:=]\s*[\"']?$")
+    r"|idempotency[-_]?key|token[ _]prefix|gitBranch|slug"
+    # hashes and identifiers that sit under key-like names
+    r"|mutex[-_]?key|metric[-_]?key|enabled[-_]?key|event[-_]?key|variable[-_]?key"
+    r"|activity[-_]?item[-_]?key|crash[-_]?reporter[-_]?key|[A-Za-z_]*id"
+    r")[\"']?\s*[:=]\s*[\"']?$")
 
 
 SUPPRESSORS = [
@@ -213,6 +248,18 @@ SUPPRESSORS = [
     Suppressor("session-log", "generic match in an AI session log or skill doc, mostly prose and tool output; typed rules still report",
                check=lambda f: "generic" in f.rule and bool(re.search(
                    r"(?i)/\.(claude|cursor)/(projects|file-history|paste-cache|todos|skills|plans)/",
+                   f.path.replace("\\", "/")))),
+    # No row inside an app's own database is actionable here, typed or not.
+    Suppressor("app-data", "inside an app's own database; sign out of the app to clear it",
+               check=lambda f: bool(APP_DATA.search(f.path.replace("\\", "/")))),
+    # ASIA ids are STS temporary credentials (IAM unique-ID prefixes). The longest
+    # any STS call can issue is 36 hours, so one in a file untouched for longer
+    # than that has expired, whatever it was.
+    Suppressor("expired-aws-session", "a temporary AWS key in a file older than its 36-hour maximum life",
+               check=lambda f: f.secret.startswith("ASIA") and _older_than(f.path, 36 * 3600)),
+    Suppressor("generic-in-text", "generic match in a log, document or data export; typed rules still report",
+               check=lambda f: "generic" in f.rule and bool(re.search(
+                   r"(?i)(\.log(\.\d+)?$|(^|/|_)logs?/|/Logs/|\.(md|mdx|rst|adoc|html?|liquid|jsonl|ndjson|csv|tsv)$)",
                    f.path.replace("\\", "/")))),
     Suppressor("unusable-key", "a private-key block that does not decode to a whole key",
                check=lambda f: f.rule == "private-key" and f.state[0] == "malformed"),
@@ -329,7 +376,7 @@ class Finding:
     @property
     def editable(self) -> bool:
         """False where any edit is worse than the leak it removes."""
-        return not ROTATE_ONLY.search(base_name(self.path))
+        return not lock_reason(self.path)
 
     @property
     def state(self) -> tuple[str, str]:
@@ -352,6 +399,7 @@ class Finding:
             "tracked": self.tracked,
             "removable": self.removable,
             "editable": self.editable,
+            "locked": lock_reason(self.path),
             "suggested": self.suggested,
             "detector": self.detector,
             "state": self.state[0],
@@ -410,6 +458,7 @@ class Group:
             "tracked_copies": sum(m.tracked for m in self.members),
             "removable": self.removable,
             "editable": self.editable,
+            "locked": next((r for m in self.members if (r := lock_reason(m.path))), ""),
             "suggested": self.suggested,
             "detector": "schema" if any(m.detector == "schema" for m in self.members) else "pattern",
             "state": self.lead.state[0],
@@ -1157,8 +1206,7 @@ def _apply_actions(groups: dict[str, Group], requested: list[dict]) -> dict:
     # Redact first: a file also queued for removal is skipped, not double-handled.
     by_file: dict[str, list[Finding]] = {}
     blocked = [(f, a) for f, a in chosen if a != "ignore" and not f.editable]
-    results += [{"fingerprint": f.fingerprint, "ok": False,
-                 "detail": "terraform state: rotate the credential, editing state corrupts it"}
+    results += [{"fingerprint": f.fingerprint, "ok": False, "detail": lock_reason(f.path)}
                 for f, _ in blocked]
     stop = {f.fingerprint for f, _ in blocked}
 
