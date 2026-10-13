@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -1163,6 +1164,18 @@ def _stash(batch: Path, src: Path) -> Path:
     return dest
 
 
+def _discard(backup: Path) -> None:
+    """Delete a backup we made. copy2 carries a read-only attribute over, and
+    Windows refuses to delete a read-only file, so clear it first. Never raises:
+    this runs inside error handling, and a backup that stays is still one undo
+    can use."""
+    try:
+        os.chmod(backup, stat.S_IWRITE | stat.S_IREAD)
+        backup.unlink()
+    except OSError:
+        pass
+
+
 def _parse_error(path: Path) -> str:
     """Empty string when the file still parses as whatever its name claims.
 
@@ -1355,7 +1368,7 @@ def _redact_file(batch: Path, src: Path, group: list[Finding], results: list[dic
             # not keep claiming them: undo would otherwise "restore" a file
             # that was never changed, over whatever is there by then.
             del entries[mark:]
-            stashed.unlink(missing_ok=True)
+            _discard(stashed)
     except OSError as e:
         detail = f"could not edit: {e.strerror or e}"
         restored = not writing
@@ -1369,7 +1382,7 @@ def _redact_file(batch: Path, src: Path, group: list[Finding], results: list[dic
             except OSError:
                 detail += "; undo puts the original back"
         if stashed and restored:
-            stashed.unlink(missing_ok=True)  # no orphan copy of the secret
+            _discard(stashed)  # no orphan copy of the secret
             del entries[mark:]
         results[first:] = [{"fingerprint": f.fingerprint, "ok": False, "detail": detail} for f in group]
 
