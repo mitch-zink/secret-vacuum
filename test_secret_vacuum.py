@@ -1618,6 +1618,35 @@ def test_a_root_level_gitleaksignore_is_reported(tmp_path: Path):
     assert len(warnings) == 1 and "2 entries" in warnings[0]
 
 
+def test_an_escaped_jwt_is_judged_by_its_claims(tmp_path: Path):
+    """A JWT at the end of a JSON-escaped string arrives with the escape's
+    backslash; it must still be read, and an expired one dropped."""
+    sandbox(tmp_path)
+    token = _jwt(sub="a", exp=1600000000)
+    (tmp_path / "state.json").write_text('{"blob": "{\\"token\\":\\"' + token + '\\"}"}\n')
+    dropped: list[sv.Finding] = []
+    kept = sv.scan([str(tmp_path)], suppressed=dropped)
+    assert not [f for f in kept if f.rule == "jwt"]
+    assert any(f.suppressed_by == "expired-jwt" and f.secret == token for f in dropped)
+
+
+def test_private_keys_are_judged_by_structure(tmp_path: Path):
+    """A whole key is reported; its truncated copy, the shape of a test fixture
+    or a broken paste, is not a usable credential."""
+    if not shutil.which("ssh-keygen"):
+        return  # present on every CI image; skip quietly elsewhere
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key), "-C", "t"],
+                   check=True, capture_output=True)
+    pem = key.read_text()
+    lines = pem.strip().splitlines()
+    assert sv.offline_check(pem)[0] == "live-shape"
+    assert sv.offline_check("\\n".join(lines))[0] == "live-shape", "JSON-escaped copy"
+    assert sv.offline_check("\n".join(lines[:2] + lines[-1:]))[0] == "malformed"
+    f = finding(str(key), "\n".join(lines[:2] + lines[-1:]), rule="private-key")
+    assert sv.partition([f])[1][0].suppressed_by == "unusable-key"
+
+
 def test_the_plain_runner_sees_every_test():
     """CI runs this file directly. A test defined below the __main__ block is
     invisible to that runner while pytest still finds it."""

@@ -214,6 +214,8 @@ SUPPRESSORS = [
                check=lambda f: "generic" in f.rule and bool(re.search(
                    r"(?i)/\.(claude|cursor)/(projects|file-history|paste-cache|todos|skills|plans)/",
                    f.path.replace("\\", "/")))),
+    Suppressor("unusable-key", "a private-key block that does not decode to a whole key",
+               check=lambda f: f.rule == "private-key" and f.state[0] == "malformed"),
     Suppressor("example-file", "a template file, its values are samples",
                check=lambda f: ("generic" in f.rule or f.rule == "credential-file-assignment")
                and bool(re.search(r"(?i)\.(example|sample|template|dist)$", base_name(f.path)))),
@@ -586,7 +588,7 @@ def scan(roots: list[str], progress: bool = False,
             start_line=h["StartLine"],
             end_line=h["EndLine"],
             entropy=h.get("Entropy", 0.0),
-            secret=h["Secret"],
+            secret=clean_secret(h["Secret"]),
             match=h.get("Match", ""),
         )
         found.setdefault(f.fingerprint, f)
@@ -943,13 +945,70 @@ def offline_check(value: str) -> tuple[str, str]:
     if AWS_ID_RE.match(v):
         return "live-shape", "well-formed AWS key id"
     if "BEGIN" in v and "PRIVATE KEY" in v:
-        body = "".join(ln for ln in v.splitlines() if "-----" not in ln)
-        try:
-            _b64pad(body.replace("/", "_").replace("+", "-"))
-        except Exception:  # noqa: BLE001
-            return "malformed", "PEM header present but the body does not decode"
-        return "live-shape", "private key, parses"
+        return private_key_state(v)
     return "unknown", ""
+
+
+def clean_secret(value: str) -> str:
+    """gitleaks reads JSON-escaped text as written, so a value at the end of an
+    escaped string keeps the escape's backslash. On one machine 54 of 55 JWTs
+    that read as unknown were expired tokens carrying exactly that."""
+    return value.rstrip("\\")
+
+
+OPENSSH_MAGIC = b"openssh-key-v1\0"
+
+
+def _der_complete(raw: bytes) -> bool:
+    """PKCS#1, PKCS#8 (plain or encrypted) and SEC1 keys are all one DER SEQUENCE
+    whose declared length is exactly the rest of the bytes."""
+    if len(raw) < 2 or raw[0] != 0x30:
+        return False
+    n = raw[1]
+    if n < 0x80:
+        return 2 + n == len(raw)
+    k = n & 0x7F
+    return 0 < k <= 4 and 2 + k + int.from_bytes(raw[2:2 + k], "big") == len(raw)
+
+
+def _openssh_complete(raw: bytes) -> bool:
+    """openssh-key-v1 (OpenSSH PROTOCOL.key): cipher, kdf, kdf options, a key
+    count, that many public keys and one private section, each length-prefixed,
+    and nothing after."""
+    at = len(OPENSSH_MAGIC)
+
+    def skip() -> bool:
+        nonlocal at
+        if at + 4 > len(raw):
+            return False
+        at += 4 + int.from_bytes(raw[at:at + 4], "big")
+        return at <= len(raw)
+
+    if not (skip() and skip() and skip()) or at + 4 > len(raw):
+        return False
+    count = int.from_bytes(raw[at:at + 4], "big")
+    at += 4
+    return 0 < count < 16 and all(skip() for _ in range(count + 1)) and at == len(raw)
+
+
+def private_key_state(pem: str) -> tuple[str, str]:
+    """A key that does not decode to a whole key cannot be used, so it is not
+    reported as one: test fixtures, truncated pastes and code that builds a PEM
+    string all land here."""
+    lines = [ln.strip().strip("\"',") for ln in pem.replace("\\n", "\n").splitlines()]
+    if any(ln.startswith("Proc-Type:") for ln in lines):
+        return "live-shape", "encrypted private key (legacy PEM), usable with its passphrase"
+    body = "".join(ln for ln in lines if ln and "-----" not in ln and ":" not in ln)
+    try:
+        raw = base64.b64decode(body + "=" * (-len(body) % 4), validate=True)
+    except ValueError:
+        return "malformed", "PEM markers present but the body is not base64"
+    if raw.startswith(OPENSSH_MAGIC):
+        return ("live-shape", "OpenSSH private key, complete") if _openssh_complete(raw) \
+            else ("malformed", "OpenSSH header but the key is incomplete")
+    if _der_complete(raw):
+        return "live-shape", "private key, complete"
+    return "malformed", "PEM body is not a complete key"
 
 
 # --------------------------------------------------------------------------- actions
